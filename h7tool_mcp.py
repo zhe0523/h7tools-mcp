@@ -597,9 +597,9 @@ class H7ToolHidModbusAdapter:
     """Read-only Modbus RTU transport over H7-TOOL's USB HID Communication interface.
 
     The connected V2.33 tool exposes VID:C251/PID:F00A interface 2 with product
-    name ``H7-TOOL HID Communication``. It accepts the same CRC-protected RTU
-    read frame used by the legacy PC source. HID report padding is transport
-    detail only and is not part of the Modbus frame.
+    name ``H7-TOOL HID Communication``. It uses 1024-byte input/output payload
+    reports (plus report ID), with standard Modbus RTU low-byte-first CRC.
+    HID padding is transport detail only and is not part of the Modbus frame.
     """
 
     config: dict[str, Any]
@@ -627,7 +627,7 @@ class H7ToolHidModbusAdapter:
 
     @staticmethod
     def _extract_frame(report: bytes) -> bytes | None:
-        """Extract one CRC-valid RTU response from a padded 64-byte HID report."""
+        """Extract one CRC-valid RTU response from a padded V2.33 HID report."""
         if len(report) < 5 or report[0] != 1:
             return None
         function = report[1]
@@ -640,7 +640,7 @@ class H7ToolHidModbusAdapter:
         if frame_length > len(report):
             return None
         frame = report[:frame_length]
-        return frame if crc16_modbus(frame[:-2]) == int.from_bytes(frame[-2:], "big") else None
+        return frame if crc16_modbus(frame[:-2]) == int.from_bytes(frame[-2:], "little") else None
 
     def read_holding_registers(self, address: int, count: int) -> list[int]:
         if not 0 <= address <= 0xFFFF or not 1 <= count <= 60:
@@ -655,18 +655,19 @@ class H7ToolHidModbusAdapter:
         if not 0 <= unit_id <= 0xFF:
             raise BridgeError("adapter.unit_id must be 0..255")
         request_body = struct.pack(">BBHH", unit_id, 0x03, address, count)
-        request = request_body + crc16_modbus(request_body).to_bytes(2, "big")
+        request = request_body + crc16_modbus(request_body).to_bytes(2, "little")
+        # V2.33 interface 2 reports are 1025 bytes including report ID 0.
+        # hidapi accepts that ID as the first byte passed to write().
+        request_report = b"\0" + request + b"\0" * (1025 - 1 - len(request))
         dev = hid.device()
         try:
             dev.open_path(item["path"])
-            # hidapi supplies report ID 0; Windows/hidapi pads the outgoing
-            # report to this interface's 1024-byte report length.
-            written = dev.write(b"\0" + request)
-            if written <= 0:
+            written = dev.write(request_report)
+            if written != len(request_report):
                 raise BridgeError("H7-TOOL HID write did not accept the read request")
             deadline = time.monotonic() + timeout_ms / 1000
             while time.monotonic() < deadline:
-                report = bytes(dev.read(64, min(100, timeout_ms)))
+                report = bytes(dev.read(1024, min(100, timeout_ms)))
                 frame = self._extract_frame(report)
                 if frame is None:
                     continue
@@ -690,8 +691,7 @@ class H7ToolHidModbusAdapter:
             except Exception:
                 pass
         raise BridgeError(
-            "No matching H7-TOOL HID response. Close the vendor PC application before using MCP, then retry; "
-            "the application and MCP otherwise compete for asynchronous HID reports."
+            "No matching H7-TOOL HID response. Verify the vendor PC application is closed and the tool is not in another active HID mode."
         )
 
 

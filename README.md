@@ -16,10 +16,9 @@ private protocol.
   included historical open-source H7-TOOL firmware.
 - A `modbus_udp` adapter implementing read-only function `0x03` over the
   current V2.33 UDP/30010 Modbus RTU framing (standard low-byte-first CRC).
-- An experimental `h7tool_hid` adapter for the current H7-TOOL USB HID
+- A verified V2.33 `h7tool_hid` adapter for the current H7-TOOL USB HID
   Communication interface: VID:C251/PID:F00A, interface 2. It implements
-  only Modbus function `0x03` reads, but the current V2.33 HID outer framing
-  has not yet been validated; use the verified UDP adapter below.
+  only Modbus function `0x03` reads using 1024-byte HID payload reports.
 
 The hardware-facing commands are intentionally disabled until their exact
 syntax and response framing are confirmed with the real device.
@@ -97,10 +96,11 @@ control. The allowed adapter types:
   configured line.
 - `serial`: opens one configured COM port per request and sends a single
   configured line; requires `pyserial`.
-- `h7tool_hid`: an experimental current USB transport. It selects only the
+- `h7tool_hid`: verified current USB transport. It selects only the
   vendor-defined `H7-TOOL HID Communication` interface and provides only
-  function-`0x03` read access. It remains experimental until its V2.33 HID
-  output framing is captured.
+  function-`0x03` read access. It is verified with V2.33 using 1024-byte
+  reports and standard low-byte-first Modbus CRC. Close the vendor PC
+  application before use because it otherwise owns the same HID reports.
 
 The `commands` values are Python format templates. Only the following
 read-oriented names are accepted by the bridge: `status`, `target_probe`,
