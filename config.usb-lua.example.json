@@ -1,0 +1,14 @@
+{
+  "adapter": {
+    "type": "h7tool_lua_serial",
+    "port": "COM16",
+    "baudrate": 115200,
+    "timeout_ms": 4000,
+    "settle_ms": 200
+  },
+  "commands": {},
+  "limits": {
+    "max_read_memory_bytes": 1024,
+    "max_log_lines": 200
+  }
+}

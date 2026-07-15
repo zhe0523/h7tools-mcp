@@ -1,0 +1,928 @@
+#!/usr/bin/env python3
+"""A deliberately read-only MCP bridge for H7-TOOL diagnostics.
+
+The device protocol is not assumed or reverse engineered here.  Commands are
+provided by the operator in a local JSON configuration after they have been
+verified against vendor documentation or a controlled manual test.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import struct
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+SERVER_NAME = "h7tool-readonly-diagnostics"
+SERVER_VERSION = "0.3.0"
+SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
+
+
+class BridgeError(Exception):
+    """An expected, user-actionable bridge error."""
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "adapter": {"type": "mock"},
+            "commands": {},
+            "limits": {"max_read_memory_bytes": 1024, "max_log_lines": 200},
+        }
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BridgeError(f"Cannot read configuration {path}: {exc}") from exc
+    if not isinstance(config, dict):
+        raise BridgeError("Configuration root must be a JSON object")
+    config.setdefault("adapter", {"type": "mock"})
+    config.setdefault("commands", {})
+    config.setdefault("limits", {})
+    config["limits"].setdefault("max_read_memory_bytes", 1024)
+    config["limits"].setdefault("max_log_lines", 200)
+    return config
+
+
+def parse_response(raw: bytes) -> dict[str, Any]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        return {"raw": "", "format": "empty"}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {"raw": text, "format": "text"}
+    return {"raw": text, "format": "json", "data": parsed}
+
+
+def crc16_modbus(data: bytes) -> int:
+    """CRC-16/MODBUS, as used by the legacy H7-TOOL USB/UDP RTU framing."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc & 0xFFFF
+
+
+@dataclass
+class CommandAdapter:
+    config: dict[str, Any]
+
+    @property
+    def kind(self) -> str:
+        return str(self.config.get("type", "mock")).lower()
+
+    def execute(self, payload: str) -> dict[str, Any]:
+        if self.kind == "mock":
+            return self._mock(payload)
+        if self.kind == "tcp":
+            return self._tcp(payload)
+        if self.kind == "serial":
+            return self._serial(payload)
+        raise BridgeError(f"Unsupported adapter type: {self.kind}")
+
+    def _mock(self, payload: str) -> dict[str, Any]:
+        values = {
+            "status": {"tool": "H7-TOOL", "mode": "mock", "connected": True, "vcc_v": 3.30},
+            "target_probe": {
+                "connected": True,
+                "debug_port": "SWD",
+                "target": "mock-cortex-m",
+                "idcode": "0x2BA01477",
+            },
+        }
+        for key, value in values.items():
+            if payload.strip().lower() == key:
+                return {"raw": json.dumps(value), "format": "json", "data": value}
+        return {"raw": f"MOCK: command accepted: {payload}", "format": "text"}
+
+    def _tcp(self, payload: str) -> dict[str, Any]:
+        host = self.config.get("host")
+        port = self.config.get("serial_port", self.config.get("port"))
+        if not isinstance(host, str) or not isinstance(port, int):
+            raise BridgeError("TCP adapter requires adapter.host and integer adapter.port")
+        timeout_s = max(0.1, float(self.config.get("timeout_ms", 1000)) / 1000)
+        ending = str(self.config.get("line_ending", "\r\n")).encode("ascii")
+        try:
+            with socket.create_connection((host, port), timeout=timeout_s) as client:
+                client.settimeout(timeout_s)
+                client.sendall(payload.encode("utf-8") + ending)
+                chunks: list[bytes] = []
+                deadline = time.monotonic() + timeout_s
+                while time.monotonic() < deadline:
+                    try:
+                        data = client.recv(4096)
+                    except socket.timeout:
+                        break
+                    if not data:
+                        break
+                    chunks.append(data)
+                    if ending and ending in data:
+                        break
+        except OSError as exc:
+            raise BridgeError(f"TCP request to {host}:{port} failed: {exc}") from exc
+        return parse_response(b"".join(chunks))
+
+    def _serial(self, payload: str) -> dict[str, Any]:
+        try:
+            import serial  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BridgeError("Serial support needs pyserial: pip install pyserial") from exc
+        port = self.config.get("port")
+        if not isinstance(port, str):
+            raise BridgeError("Serial adapter requires adapter.port, for example COM16")
+        timeout_s = max(0.1, float(self.config.get("timeout_ms", 1000)) / 1000)
+        baudrate = int(self.config.get("baudrate", 115200))
+        ending = str(self.config.get("line_ending", "\r\n")).encode("ascii")
+        try:
+            with serial.Serial(port, baudrate=baudrate, timeout=timeout_s, write_timeout=timeout_s) as dev:
+                dev.reset_input_buffer()
+                dev.write(payload.encode("utf-8") + ending)
+                dev.flush()
+                response = dev.read_until(ending) if ending else dev.read(4096)
+        except Exception as exc:  # pyserial exposes platform-specific exception types
+            raise BridgeError(f"Serial request to {port} failed: {exc}") from exc
+        return parse_response(response)
+
+
+@dataclass
+class LegacyH7ToolLuaSerialAdapter:
+    """Run the bundled read-only health Lua script over the legacy USB COM protocol.
+
+    The H7-TOOL V1.4.4 PC source documents function 0x64 (download/execute
+    Lua) and function 0x61 (asynchronous Lua ``print`` output).  Only the
+    repository's fixed ``tool_health.lua`` is sent; MCP callers cannot provide
+    arbitrary Lua or any write/reset/program command.
+    """
+
+    config: dict[str, Any]
+
+    @staticmethod
+    def _frame_length(data: bytearray) -> int | None:
+        """Return one complete legacy frame length, 0 for bad sync, or None."""
+        if len(data) < 2:
+            return None
+        if data[0] != 1:
+            return 0
+        if data[1] == 0x64:
+            return 5 if len(data) >= 5 else None
+        if data[1] == 0x61:
+            if len(data) < 5:
+                return None
+            return int.from_bytes(data[3:5], "big") + 7
+        # A Modbus exception is five bytes.  It is useful to return a clear
+        # error instead of blocking while a device is in an unexpected mode.
+        if data[1] & 0x80:
+            return 5 if len(data) >= 5 else None
+        return 0
+
+    @staticmethod
+    def _valid_frame(frame: bytes) -> bool:
+        return len(frame) >= 5 and crc16_modbus(frame[:-2]) == int.from_bytes(frame[-2:], "big")
+
+    def run_health_script(self) -> dict[str, Any]:
+        try:
+            import serial  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BridgeError(
+                "H7-TOOL USB Lua support needs pyserial. Run: "
+                "& $py -m pip install -r .\\mcp\\requirements.txt"
+            ) from exc
+        port = self.config.get("port")
+        if not isinstance(port, str) or not port.strip():
+            raise BridgeError("h7tool_lua_serial requires adapter.port, for example COM16")
+        script_path = Path(__file__).with_name("diagnostics") / "tool_health.lua"
+        try:
+            script = script_path.read_bytes()
+        except OSError as exc:
+            raise BridgeError(f"Cannot read bundled health script: {exc}") from exc
+        if b"H7TOOL_DIAG_BEGIN" not in script or b"H7TOOL_DIAG_END" not in script:
+            raise BridgeError("Bundled health script failed its safety marker check")
+        # H64_LUA_RUN_WITH_RESET (0) resets Lua state only, then executes the
+        # script. It does not reset the target or H7-TOOL hardware.
+        payload = script + (b"" if script.endswith(b"\0") else b"\0")
+        request_body = struct.pack(">BBHIII", 1, 0x64, 0, len(payload), 0, len(payload)) + payload
+        request = request_body + crc16_modbus(request_body).to_bytes(2, "big")
+        timeout_s = max(1.0, float(self.config.get("timeout_ms", 4000)) / 1000)
+        settle_s = max(0.05, float(self.config.get("settle_ms", 200)) / 1000)
+        baudrate = int(self.config.get("baudrate", 115200))
+        buffer = bytearray()
+        output = bytearray()
+        ack_seen = False
+        frames = 0
+        deadline = time.monotonic() + timeout_s
+        last_frame_at = time.monotonic()
+        try:
+            with serial.Serial(port, baudrate=baudrate, timeout=0.05, write_timeout=timeout_s) as dev:
+                dev.reset_input_buffer()
+                dev.write(request)
+                dev.flush()
+                while time.monotonic() < deadline:
+                    waiting = getattr(dev, "in_waiting", 0)
+                    chunk = dev.read(waiting or 1)
+                    if chunk:
+                        buffer.extend(chunk)
+                    while True:
+                        frame_len = self._frame_length(buffer)
+                        if frame_len is None:
+                            break
+                        if frame_len == 0:
+                            del buffer[0]
+                            continue
+                        if len(buffer) < frame_len:
+                            break
+                        frame = bytes(buffer[:frame_len])
+                        del buffer[:frame_len]
+                        if not self._valid_frame(frame):
+                            continue
+                        frames += 1
+                        last_frame_at = time.monotonic()
+                        if frame[1] == 0x64:
+                            if frame[2] != 0:
+                                raise BridgeError(f"H7-TOOL rejected health Lua, status {frame[2]}")
+                            ack_seen = True
+                        elif frame[1] == 0x61 and frame[2] == 0:
+                            output.extend(frame[5:-2])
+                        elif frame[1] & 0x80:
+                            raise BridgeError(f"H7-TOOL returned Modbus exception 0x{frame[1]:02X}")
+                    text = output.decode("utf-8", errors="replace")
+                    if "H7TOOL_DIAG_END" in text and time.monotonic() - last_frame_at >= settle_s:
+                        break
+        except BridgeError:
+            raise
+        except Exception as exc:  # pyserial exposes platform-specific exception types
+            raise BridgeError(f"H7-TOOL USB request to {port} failed: {exc}") from exc
+        text = output.decode("utf-8", errors="replace").strip()
+        if not ack_seen:
+            raise BridgeError(f"No H7-TOOL Lua acknowledgement from {port}; verify COM port and close the vendor app")
+        if "H7TOOL_DIAG_BEGIN" not in text or "H7TOOL_DIAG_END" not in text:
+            raise BridgeError(f"Lua was acknowledged but diagnostic output was incomplete: {text!r}")
+        return {
+            "transport": "legacy_usb_virtual_com/function_64_lua + function_61_print",
+            "script": "diagnostics/tool_health.lua",
+            "frames": frames,
+            "result": parse_response(output),
+        }
+
+
+@dataclass
+class ModbusTcpAdapter:
+    """Read-only Modbus TCP transport used by the open-source H7-TOOL V1.49 app.
+
+    The source shows the device accepts a normal 6-byte MBAP header followed by
+    unit-id and PDU.  This adapter implements function 0x03 only.
+    """
+
+    config: dict[str, Any]
+    transaction_id: int = 0
+
+    def read_holding_registers(self, address: int, count: int) -> list[int]:
+        if not 0 <= address <= 0xFFFF or not 1 <= count <= 60:
+            raise BridgeError("Modbus read address must be 0..65535 and count must be 1..60")
+        host = self.config.get("host")
+        port = self.config.get("port")
+        if not isinstance(host, str) or not isinstance(port, int):
+            raise BridgeError("modbus_tcp adapter requires adapter.host and integer adapter.port")
+        unit_id = int(self.config.get("unit_id", 1))
+        if not 0 <= unit_id <= 0xFF:
+            raise BridgeError("adapter.unit_id must be 0..255")
+        timeout_s = max(0.1, float(self.config.get("timeout_ms", 1000)) / 1000)
+        self.transaction_id = (self.transaction_id + 1) & 0xFFFF
+        pdu = struct.pack(">BHH", 0x03, address, count)
+        request = struct.pack(">HHHB", self.transaction_id, 0, len(pdu) + 1, unit_id) + pdu
+        try:
+            with socket.create_connection((host, port), timeout=timeout_s) as client:
+                client.settimeout(timeout_s)
+                client.sendall(request)
+                header = self._recv_exact(client, 6)
+                response_transaction, protocol_id, length = struct.unpack(">HHH", header)
+                if response_transaction != self.transaction_id or protocol_id != 0 or not 2 <= length <= 260:
+                    raise BridgeError("Unexpected Modbus TCP response header")
+                body = self._recv_exact(client, length)
+        except BridgeError:
+            raise
+        except OSError as exc:
+            raise BridgeError(f"Modbus TCP request to {host}:{port} failed: {exc}") from exc
+        if body[0] != unit_id:
+            raise BridgeError(f"Unexpected Modbus unit id in response: {body[0]}")
+        response_pdu = body[1:]
+        if not response_pdu:
+            raise BridgeError("Empty Modbus PDU")
+        if response_pdu[0] == 0x83:
+            code = response_pdu[1] if len(response_pdu) > 1 else None
+            raise BridgeError(f"H7-TOOL rejected holding-register read; Modbus exception {code}")
+        if response_pdu[0] != 0x03 or len(response_pdu) < 2:
+            raise BridgeError("Unexpected Modbus function response")
+        byte_count = response_pdu[1]
+        data = response_pdu[2:]
+        if byte_count != count * 2 or len(data) != byte_count:
+            raise BridgeError("Malformed Modbus register payload")
+        return list(struct.unpack(">" + "H" * count, data))
+
+    @staticmethod
+    def _recv_exact(client: socket.socket, size: int) -> bytes:
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            part = client.recv(remaining)
+            if not part:
+                raise BridgeError("Modbus TCP connection closed before the full response arrived")
+            chunks.append(part)
+            remaining -= len(part)
+        return b"".join(chunks)
+
+
+@dataclass
+class ModbusUdpAdapter:
+    """Read-only Modbus RTU over the legacy H7-TOOL UDP transport.
+
+    The current V2.33 PC application sends ordinary Modbus RTU frames to
+    UDP/30010, with the standard low-byte-first CRC field. A six-byte MAC
+    prefix is only needed for broadcast discovery, so the bridge uses unicast
+    requests to avoid unnecessary LAN traffic.
+    """
+
+    config: dict[str, Any]
+
+    @staticmethod
+    def _session_poll_frame(index: int) -> bytes:
+        """V2.33 UDP channel poll observed from the vendor PC application."""
+        body = bytes((1, 0x61, 0, index, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0))
+        return body + crc16_modbus(body).to_bytes(2, "little")
+
+    def read_holding_registers(self, address: int, count: int) -> list[int]:
+        if not 0 <= address <= 0xFFFF or not 1 <= count <= 60:
+            raise BridgeError("Modbus read address must be 0..65535 and count must be 1..60")
+        host = self.config.get("host")
+        port = self.config.get("port", 30010)
+        if not isinstance(host, str) or not isinstance(port, int):
+            raise BridgeError("modbus_udp adapter requires adapter.host and integer adapter.port")
+        unit_id = int(self.config.get("unit_id", 1))
+        if not 0 <= unit_id <= 0xFF:
+            raise BridgeError("adapter.unit_id must be 0..255")
+        timeout_s = max(0.1, float(self.config.get("timeout_ms", 1000)) / 1000)
+        frame = struct.pack(">BBHH", unit_id, 0x03, address, count)
+        request = frame + crc16_modbus(frame).to_bytes(2, "little")
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                # V2.33 begins its UDP exchange with five channel poll frames.
+                # They are read-only keepalive/receive-window requests and let
+                # MCP work even when the vendor application is not running.
+                if bool(self.config.get("session_poll", True)):
+                    for index in range(5):
+                        client.sendto(self._session_poll_frame(index), (host, port))
+                client.sendto(request, (host, port))
+                deadline = time.monotonic() + timeout_s
+                response = b""
+                while time.monotonic() < deadline:
+                    client.settimeout(max(0.01, min(0.1, deadline - time.monotonic())))
+                    try:
+                        candidate, _peer = client.recvfrom(2048)
+                    except socket.timeout:
+                        continue
+                    # Ignore the asynchronous 0x61 responses to the session
+                    # poll and wait for the requested function-0x03 response.
+                    candidate_frame = candidate[6:] if len(candidate) >= 8 and candidate[6] == unit_id else candidate
+                    if len(candidate_frame) >= 2 and candidate_frame[0] == unit_id and candidate_frame[1] in {0x03, 0x83}:
+                        response = candidate
+                        break
+                if not response:
+                    raise BridgeError(f"Modbus UDP request to {host}:{port} timed out")
+        except BridgeError:
+            raise
+        except OSError as exc:
+            raise BridgeError(f"Modbus UDP request to {host}:{port} failed: {exc}") from exc
+        # A broadcast request receives a six-byte MAC prefix. We send unicast,
+        # but accept the prefix so captures and devices with that behavior work.
+        if len(response) >= 8 and response[6] == unit_id and response[7] == 0x03:
+            response = response[6:]
+        if len(response) < 5:
+            raise BridgeError("Truncated Modbus UDP response")
+        if response[0] != unit_id:
+            raise BridgeError(f"Unexpected Modbus unit id in response: {response[0]}")
+        # Current V2.33 firmware appends a zero pad byte to some UDP replies.
+        # Select the RTU frame length from the Modbus function payload instead
+        # of treating the final datagram bytes as CRC unconditionally.
+        if response[1] == 0x03:
+            frame_length = 5 + response[2]
+        elif response[1] == 0x83:
+            frame_length = 5
+        else:
+            raise BridgeError("Unexpected Modbus function response")
+        if len(response) < frame_length:
+            raise BridgeError("Truncated Modbus UDP response")
+        response = response[:frame_length]
+        expected_crc = int.from_bytes(response[-2:], "little")
+        if crc16_modbus(response[:-2]) != expected_crc:
+            raise BridgeError("Invalid Modbus UDP response CRC")
+        if response[1] == 0x83:
+            code = response[2] if len(response) > 2 else None
+            raise BridgeError(f"H7-TOOL rejected holding-register read; Modbus exception {code}")
+        byte_count = response[2]
+        data = response[3:-2]
+        if byte_count != count * 2 or len(data) != byte_count:
+            raise BridgeError("Malformed Modbus UDP register payload")
+        return list(struct.unpack(">" + "H" * count, data))
+
+
+def registers_to_float(registers: list[int], offset: int) -> float:
+    return struct.unpack(">f", struct.pack(">HH", registers[offset], registers[offset + 1]))[0]
+
+
+def decode_h7tool_status(identity: list[int], analog: list[int]) -> dict[str, Any]:
+    """Decode the V1.49 read-only register map; newer firmware is verified at runtime."""
+    if len(identity) != 12 or len(analog) != 20:
+        raise ValueError("unexpected H7-TOOL status register span")
+    version = identity[7]
+    version_minor_bcd = version & 0xFF
+    measurement_names = (
+        "ch1_v",
+        "ch2_v",
+        "high_side_v",
+        "high_side_a",
+        "tvcc_v",
+        "tvcc_a",
+        "ntc_ohm",
+        "ntc_c",
+        "usb_5v",
+        "external_power_v",
+    )
+    measurements = {name: registers_to_float(analog, index * 2) for index, name in enumerate(measurement_names)}
+    return {
+        "register_map": "H7-TOOL V2.33 UDP map, validated against the connected tool; field semantics beyond listed values remain compatibility data",
+        "device_id_hex": "".join(f"{identity[index + 1]:04X}{identity[index]:04X}" for index in range(0, 6, 2)),
+        "hardware_model": identity[6],
+        "app_version_raw": f"0x{version:04X}",
+        "app_version": f"{version >> 8}.{version_minor_bcd >> 4}{version_minor_bcd & 0x0F}",
+        "gpio_inputs_bits": f"0x{identity[8]:04X}{identity[9]:04X}",
+        "gpio_outputs_bits": f"0x{identity[10]:04X}{identity[11]:04X}",
+        "measurements": measurements,
+    }
+
+
+def list_windows_serial_ports() -> list[dict[str, Any]]:
+    if os.name != "nt":
+        return []
+    command = (
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+        "Get-CimInstance Win32_SerialPort | "
+        "Select-Object DeviceID,Name,Description | ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+        output = result.stdout.decode("utf-8-sig", errors="replace")
+        if result.returncode != 0 or not output.strip():
+            return []
+        entries = json.loads(output)
+        return entries if isinstance(entries, list) else [entries]
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return []
+
+
+def list_h7tool_hid_devices() -> list[dict[str, Any]]:
+    """Enumerate H7-TOOL HID interfaces without opening or writing to them."""
+    try:
+        import hid  # type: ignore[import-not-found]
+    except ImportError:
+        return []
+    devices: list[dict[str, Any]] = []
+    try:
+        for item in hid.enumerate(0xC251, 0xF00A):
+            devices.append(
+                {
+                    "vendor_id": f"0x{item['vendor_id']:04X}",
+                    "product_id": f"0x{item['product_id']:04X}",
+                    "interface_number": item.get("interface_number"),
+                    "product": item.get("product_string"),
+                    "manufacturer": item.get("manufacturer_string"),
+                    "serial_number": item.get("serial_number"),
+                    "usage_page": f"0x{item.get('usage_page', 0):04X}",
+                    "usage": f"0x{item.get('usage', 0):04X}",
+                }
+            )
+    except OSError:
+        return []
+    return devices
+
+
+@dataclass
+class H7ToolHidModbusAdapter:
+    """Read-only Modbus RTU transport over H7-TOOL's USB HID Communication interface.
+
+    The connected V2.33 tool exposes VID:C251/PID:F00A interface 2 with product
+    name ``H7-TOOL HID Communication``. It accepts the same CRC-protected RTU
+    read frame used by the legacy PC source. HID report padding is transport
+    detail only and is not part of the Modbus frame.
+    """
+
+    config: dict[str, Any]
+
+    def _find_interface(self) -> dict[str, Any]:
+        try:
+            import hid  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
+        vendor_id = int(self.config.get("vendor_id", 0xC251))
+        product_id = int(self.config.get("product_id", 0xF00A))
+        interface_number = int(self.config.get("interface_number", 2))
+        serial_number = self.config.get("serial_number")
+        candidates = [item for item in hid.enumerate(vendor_id, product_id) if item.get("interface_number") == interface_number]
+        if isinstance(serial_number, str) and serial_number:
+            candidates = [item for item in candidates if item.get("serial_number") == serial_number]
+        if not candidates:
+            raise BridgeError(
+                f"H7-TOOL HID Communication interface not found (VID:PID={vendor_id:04X}:{product_id:04X}, interface {interface_number}). "
+                "Connect H7-TOOL directly by USB and confirm it appears in --list-hid-devices."
+            )
+        if len(candidates) > 1:
+            raise BridgeError("More than one matching H7-TOOL HID interface found; set adapter.serial_number in config.json")
+        return candidates[0]
+
+    @staticmethod
+    def _extract_frame(report: bytes) -> bytes | None:
+        """Extract one CRC-valid RTU response from a padded 64-byte HID report."""
+        if len(report) < 5 or report[0] != 1:
+            return None
+        function = report[1]
+        if function == 0x03 and len(report) >= 3:
+            frame_length = 5 + report[2]
+        elif function & 0x80:
+            frame_length = 5
+        else:
+            return None
+        if frame_length > len(report):
+            return None
+        frame = report[:frame_length]
+        return frame if crc16_modbus(frame[:-2]) == int.from_bytes(frame[-2:], "big") else None
+
+    def read_holding_registers(self, address: int, count: int) -> list[int]:
+        if not 0 <= address <= 0xFFFF or not 1 <= count <= 60:
+            raise BridgeError("Modbus read address must be 0..65535 and count must be 1..60")
+        try:
+            import hid  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
+        item = self._find_interface()
+        timeout_ms = max(100, int(self.config.get("timeout_ms", 1000)))
+        unit_id = int(self.config.get("unit_id", 1))
+        if not 0 <= unit_id <= 0xFF:
+            raise BridgeError("adapter.unit_id must be 0..255")
+        request_body = struct.pack(">BBHH", unit_id, 0x03, address, count)
+        request = request_body + crc16_modbus(request_body).to_bytes(2, "big")
+        dev = hid.device()
+        try:
+            dev.open_path(item["path"])
+            # hidapi supplies report ID 0; Windows/hidapi pads the outgoing
+            # report to this interface's 1024-byte report length.
+            written = dev.write(b"\0" + request)
+            if written <= 0:
+                raise BridgeError("H7-TOOL HID write did not accept the read request")
+            deadline = time.monotonic() + timeout_ms / 1000
+            while time.monotonic() < deadline:
+                report = bytes(dev.read(64, min(100, timeout_ms)))
+                frame = self._extract_frame(report)
+                if frame is None:
+                    continue
+                if frame[0] != unit_id:
+                    continue
+                if frame[1] == 0x83:
+                    raise BridgeError(f"H7-TOOL rejected holding-register read; Modbus exception {frame[2]}")
+                if frame[1] != 0x03 or frame[2] != count * 2:
+                    continue
+                data = frame[3:-2]
+                if len(data) != count * 2:
+                    continue
+                return list(struct.unpack(">" + "H" * count, data))
+        except BridgeError:
+            raise
+        except Exception as exc:  # hidapi has platform-specific exception types
+            raise BridgeError(f"H7-TOOL HID read request failed: {exc}") from exc
+        finally:
+            try:
+                dev.close()
+            except Exception:
+                pass
+        raise BridgeError(
+            "No matching H7-TOOL HID response. Close the vendor PC application before using MCP, then retry; "
+            "the application and MCP otherwise compete for asynchronous HID reports."
+        )
+
+
+class H7ToolMcp:
+    def __init__(self, config: dict[str, Any], config_path: Path) -> None:
+        self.config = config
+        self.config_path = config_path
+        self.adapter = CommandAdapter(config["adapter"])
+        self.modbus = ModbusTcpAdapter(config["adapter"])
+        self.modbus_udp = ModbusUdpAdapter(config["adapter"])
+        self.hid_modbus = H7ToolHidModbusAdapter(config["adapter"])
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "safety": "read-only; no flash, erase, power, reset, or protection tools are exposed",
+            "adapter": self.adapter.kind,
+            "config_path": str(self.config_path),
+            "configured_commands": sorted(self.config["commands"].keys()),
+            "serial_ports": list_windows_serial_ports(),
+            "h7tool_hid_devices": list_h7tool_hid_devices(),
+        }
+
+    def run_configured_command(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        template = self.config["commands"].get(name)
+        if template is None:
+            raise BridgeError(
+                f"Command '{name}' is not configured. Copy config.example.json to config.json and "
+                "add a command verified from vendor documentation or a manual test."
+            )
+        if not isinstance(template, str) or not template.strip():
+            raise BridgeError(f"Command '{name}' must be a non-empty string template")
+        try:
+            payload = template.format(**arguments)
+        except KeyError as exc:
+            raise BridgeError(f"Command '{name}' requires missing argument: {exc.args[0]}") from exc
+        result = self.adapter.execute(payload)
+        return {"command": name, "result": result}
+
+    def read_modbus_status(self) -> dict[str, Any]:
+        # 0x0000..0x000B: UID, model/version, and GPIO status.
+        # 0x000C..0x001F: ten IEEE-754 measurements (two registers each).
+        if self.adapter.kind == "modbus_udp":
+            reader = self.modbus_udp
+        elif self.adapter.kind == "h7tool_hid":
+            reader = self.hid_modbus
+        else:
+            reader = self.modbus
+        identity = reader.read_holding_registers(0x0000, 12)
+        analog = reader.read_holding_registers(0x000C, 20)
+        return {
+            "transport": f"{self.adapter.kind}/function_03/read_holding_registers",
+            "data": decode_h7tool_status(identity, analog),
+        }
+
+    def read_modbus_registers(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        address_text = str(arguments.get("address", ""))
+        count = int(arguments.get("count", 0))
+        if not address_text.startswith("0x"):
+            raise BridgeError("address must be hexadecimal, for example 0x0000")
+        try:
+            address = int(address_text, 16)
+        except ValueError as exc:
+            raise BridgeError("address must be hexadecimal, for example 0x0000") from exc
+        if not 1 <= count <= 60:
+            raise BridgeError("count must be between 1 and 60 registers")
+        if self.adapter.kind == "modbus_udp":
+            reader = self.modbus_udp
+        elif self.adapter.kind == "h7tool_hid":
+            reader = self.hid_modbus
+        else:
+            reader = self.modbus
+        values = reader.read_holding_registers(address, count)
+        return {
+            "transport": f"{self.adapter.kind}/function_03/read_holding_registers",
+            "address": f"0x{address:04X}",
+            "count": count,
+            "values_u16": values,
+            "values_hex": [f"0x{value:04X}" for value in values],
+        }
+
+    def read_lua_health(self) -> dict[str, Any]:
+        return LegacyH7ToolLuaSerialAdapter(self.config["adapter"]).run_health_script()
+
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name == "bridge_status":
+            return self.status()
+        if name == "tool_status":
+            if self.adapter.kind in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
+                return self.read_modbus_status()
+            if self.adapter.kind == "h7tool_lua_serial":
+                return self.read_lua_health()
+            return self.run_configured_command("status", arguments)
+        if name == "tool_registers":
+            if self.adapter.kind not in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
+                raise BridgeError("tool_registers requires adapter.type = modbus_tcp, modbus_udp, or h7tool_hid")
+            return self.read_modbus_registers(arguments)
+        if name == "target_probe":
+            return self.run_configured_command("target_probe", arguments)
+        if name == "log_tail":
+            source = str(arguments.get("source", ""))
+            if source not in {"uart", "rtt", "can"}:
+                raise BridgeError("log_tail source must be uart, rtt, or can")
+            lines = int(arguments.get("lines", 50))
+            max_lines = int(self.config["limits"]["max_log_lines"])
+            if not 1 <= lines <= max_lines:
+                raise BridgeError(f"lines must be between 1 and {max_lines}")
+            return self.run_configured_command(f"{source}_tail", {"lines": lines})
+        if name == "read_memory":
+            address = str(arguments.get("address", ""))
+            length = int(arguments.get("length", 0))
+            max_length = int(self.config["limits"]["max_read_memory_bytes"])
+            if not address.startswith("0x"):
+                raise BridgeError("address must be hexadecimal, for example 0x20000000")
+            if not 1 <= length <= max_length:
+                raise BridgeError(f"length must be between 1 and {max_length} bytes")
+            return self.run_configured_command("read_memory", {"address": address, "length": length})
+        raise BridgeError(f"Unknown tool: {name}")
+
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "bridge_status",
+        "description": "Show bridge configuration, available serial ports/H7-TOOL HID interfaces, and the read-only safety policy. Does not contact H7-TOOL.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "tool_status",
+        "description": "Read H7-TOOL status. With adapter.type=h7tool_lua_serial, runs only the bundled read-only health Lua script; other adapters require a configured verified command.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "target_probe",
+        "description": "Run the configured read-only target probe command, for example SWD ID/UID detection.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "tool_registers",
+        "description": "Read H7-TOOL holding registers with Modbus function 0x03 over TCP, legacy UDP, or USB HID Communication. Never writes registers.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "pattern": "^0x[0-9A-Fa-f]+$"},
+                "count": {"type": "integer", "minimum": 1, "maximum": 60},
+            },
+            "required": ["address", "count"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "log_tail",
+        "description": "Read a bounded UART, RTT, or CAN log window through a configured read-only command.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "enum": ["uart", "rtt", "can"]},
+                "lines": {"type": "integer", "minimum": 1, "default": 50},
+            },
+            "required": ["source"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "read_memory",
+        "description": "Read a bounded memory range through a configured read-only command. It cannot write target memory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "pattern": "^0x[0-9A-Fa-f]+$"},
+                "length": {"type": "integer", "minimum": 1, "maximum": 1024},
+            },
+            "required": ["address", "length"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+def result_message(value: Any, is_error: bool = False) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, indent=2)}], "isError": is_error}
+
+
+def jsonrpc_response(request_id: Any, result: Any = None, error: dict[str, Any] | None = None) -> dict[str, Any]:
+    message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id}
+    if error is not None:
+        message["error"] = error
+    else:
+        message["result"] = result
+    return message
+
+
+def handle_request(server: H7ToolMcp, request: dict[str, Any]) -> dict[str, Any] | None:
+    method = request.get("method")
+    request_id = request.get("id")
+    if not isinstance(method, str):
+        return jsonrpc_response(request_id, error={"code": -32600, "message": "Invalid JSON-RPC request"})
+    if request_id is None:  # MCP notifications, including notifications/initialized
+        return None
+    try:
+        if method == "initialize":
+            client_version = request.get("params", {}).get("protocolVersion", "2024-11-05")
+            protocol_version = client_version if client_version in SUPPORTED_PROTOCOL_VERSIONS else "2024-11-05"
+            return jsonrpc_response(
+                request_id,
+                {
+                    "protocolVersion": protocol_version,
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                    "instructions": "Read-only diagnostic bridge. Configure only verified H7-TOOL commands before requesting hardware data.",
+                },
+            )
+        if method == "tools/list":
+            return jsonrpc_response(request_id, {"tools": TOOLS})
+        if method == "tools/call":
+            params = request.get("params", {})
+            name = params.get("name")
+            arguments = params.get("arguments", {})
+            if not isinstance(name, str) or not isinstance(arguments, dict):
+                raise BridgeError("tools/call requires string name and object arguments")
+            return jsonrpc_response(request_id, result_message(server.call_tool(name, arguments)))
+        return jsonrpc_response(request_id, error={"code": -32601, "message": f"Method not found: {method}"})
+    except BridgeError as exc:
+        return jsonrpc_response(request_id, result_message({"error": str(exc)}, is_error=True))
+    except (TypeError, ValueError) as exc:
+        return jsonrpc_response(request_id, result_message({"error": f"Invalid arguments: {exc}"}, is_error=True))
+    except Exception as exc:  # Do not leak a traceback through the MCP channel.
+        print(f"Unexpected bridge error: {exc}", file=sys.stderr, flush=True)
+        return jsonrpc_response(request_id, result_message({"error": "Unexpected bridge error; see server stderr."}, is_error=True))
+
+
+def serve(server: H7ToolMcp) -> int:
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError("message must be an object")
+            response = handle_request(server, request)
+        except (json.JSONDecodeError, ValueError) as exc:
+            response = jsonrpc_response(None, error={"code": -32700, "message": f"Parse error: {exc}"})
+        if response is not None:
+            print(json.dumps(response, ensure_ascii=False), flush=True)
+    return 0
+
+
+def self_test(_server: H7ToolMcp) -> int:
+    # Always isolate the self-test from the operator's hardware configuration.
+    server = H7ToolMcp(load_config(Path("__nonexistent_mock_config__.json")), Path("__nonexistent_mock_config__.json"))
+    assert server.status()["adapter"] == "mock"
+    assert server.adapter.execute("target_probe")["data"]["debug_port"] == "SWD"
+    sample = bytes.fromhex("01 64 00 00 00")
+    assert LegacyH7ToolLuaSerialAdapter._frame_length(bytearray(sample)) == 5
+    assert LegacyH7ToolLuaSerialAdapter._frame_length(bytearray(b"\x01\x61\x00\x00\x03abc")) == 10
+    try:
+        server.call_tool("read_memory", {"address": "0x20000000", "length": 4096})
+    except BridgeError:
+        pass
+    else:
+        raise AssertionError("memory read limit was not enforced")
+    print("Self-test passed: MCP bridge is running in safe mock mode.")
+    return 0
+
+
+def main() -> int:
+    # MCP stdio is UTF-8 JSON regardless of the active Windows console codepage.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except AttributeError:
+            pass
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=Path(os.environ.get("H7TOOL_MCP_CONFIG", DEFAULT_CONFIG_PATH)))
+    parser.add_argument("--list-serial-ports", action="store_true", help="List Windows serial devices and exit")
+    parser.add_argument("--list-hid-devices", action="store_true", help="List matching H7-TOOL USB HID interfaces and exit")
+    parser.add_argument("--self-test", action="store_true", help="Test MCP logic using only the built-in mock adapter")
+    parser.add_argument("--probe-h7tool", action="store_true", help="Run the configured read-only tool_status probe and print JSON")
+    parser.add_argument("--tool-registers", nargs=2, metavar=("ADDRESS", "COUNT"), help="Read bounded H7-TOOL holding registers through the configured Modbus adapter")
+    args = parser.parse_args()
+    if args.list_serial_ports:
+        print(json.dumps(list_windows_serial_ports(), ensure_ascii=False, indent=2))
+        return 0
+    if args.list_hid_devices:
+        print(json.dumps(list_h7tool_hid_devices(), ensure_ascii=False, indent=2))
+        return 0
+    config = load_config(args.config)
+    server = H7ToolMcp(config, args.config)
+    if args.self_test:
+        return self_test(server)
+    if args.probe_h7tool:
+        try:
+            print(json.dumps(server.call_tool("tool_status", {}), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.tool_registers:
+        try:
+            address, count = args.tool_registers
+            print(json.dumps(server.call_tool("tool_registers", {"address": address, "count": int(count)}), ensure_ascii=False, indent=2))
+            return 0
+        except (BridgeError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    return serve(server)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

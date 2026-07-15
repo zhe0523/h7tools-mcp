@@ -1,0 +1,14 @@
+{
+  "adapter": {
+    "type": "modbus_udp",
+    "host": "192.168.1.6",
+    "port": 30010,
+    "unit_id": 1,
+    "timeout_ms": 1000
+  },
+  "commands": {},
+  "limits": {
+    "max_read_memory_bytes": 1024,
+    "max_log_lines": 200
+  }
+}

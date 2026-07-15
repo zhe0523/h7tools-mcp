@@ -1,0 +1,2 @@
+pyserial>=3.5,<4
+hidapi>=0.15,<1

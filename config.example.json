@@ -1,0 +1,23 @@
+{
+  "adapter": {
+    "type": "mock",
+    "host": "192.168.0.101",
+    "port": 8080,
+    "serial_port": "COM16",
+    "baudrate": 115200,
+    "timeout_ms": 1000,
+    "line_ending": "\r\n"
+  },
+  "commands": {
+    "status": "status",
+    "target_probe": "target_probe",
+    "read_memory": "read_memory {address} {length}",
+    "uart_tail": "uart_tail {lines}",
+    "rtt_tail": "rtt_tail {lines}",
+    "can_tail": "can_tail {lines}"
+  },
+  "limits": {
+    "max_read_memory_bytes": 1024,
+    "max_log_lines": 200
+  }
+}

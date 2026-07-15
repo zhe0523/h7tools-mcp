@@ -1,0 +1,7 @@
+# Locally verified commands and LAN/serial endpoint settings.
+config.json
+__pycache__/
+*.py[cod]
+h7tool_udp.etl
+h7tool_udp.pcapng
+h7tool_udp.txt

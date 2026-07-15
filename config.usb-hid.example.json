@@ -1,0 +1,16 @@
+{
+  "adapter": {
+    "type": "h7tool_hid",
+    "vendor_id": 49745,
+    "product_id": 61450,
+    "interface_number": 2,
+    "serial_number": "003C001E3232511736303936",
+    "unit_id": 1,
+    "timeout_ms": 1000
+  },
+  "commands": {},
+  "limits": {
+    "max_read_memory_bytes": 1024,
+    "max_log_lines": 200
+  }
+}
