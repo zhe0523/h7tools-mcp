@@ -39,6 +39,7 @@ select Ethernet/WiFi, then use the current local configuration:
 
 ```powershell
 & $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --probe-h7tool
+& $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --health-summary
 & $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --tool-registers 0x0400 6
 ```
 
@@ -77,7 +78,8 @@ which is included in `requirements.txt`.
    The expected current values are UID `003C001E3232511736303936`, hardware
    `0x0752`, and app `2.33`.
 4. Add the MCP server and call `tool_status` or bounded `tool_registers`.
-   Both are read-only.
+   Call `health_summary` for a conservative, AI-friendly assessment of H7-TOOL
+   itself. All three tools are read-only.
 
 ## Configuration
 
@@ -106,6 +108,14 @@ read-oriented names are accepted by the bridge: `status`, `target_probe`,
 
 `read_memory` is capped at 1024 bytes and logs are capped at 200 lines by
 default. Changing those limits does not permit any write action.
+
+## Health summary
+
+`health_summary` evaluates only H7-TOOL's own TVCC and USB 5V supplies using
+conservative ranges, and reports an NTC value outside -40..125 C as unknown
+(commonly an unconnected sensor), rather than a hardware fault. Target-facing
+measurements such as CH1/CH2 and high-side voltage/current are observations:
+zero may be correct when no target is connected.
 
 The Modbus status decoder reads the legacy V1.49 identity and analog register
 map: device ID `0x0000..0x0005`, model/version and GPIO `0x0006..0x000B`, and

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import socket
 import struct
@@ -469,6 +470,78 @@ def decode_h7tool_status(identity: list[int], analog: list[int]) -> dict[str, An
     }
 
 
+def summarize_h7tool_health(status: dict[str, Any]) -> dict[str, Any]:
+    """Turn the verified V2.33 status map into conservative health checks.
+
+    This function deliberately treats target-facing readings (CH1, CH2, and
+    high-side) as observations, not faults: a disconnected target can make
+    those values correctly read as zero. Only H7-TOOL's own supply rails have
+    bounded warnings.
+    """
+    measurements = status.get("measurements")
+    if not isinstance(measurements, dict):
+        raise BridgeError("H7-TOOL status did not contain measurement data")
+    checks: list[dict[str, Any]] = []
+
+    def bounded_check(name: str, field: str, minimum: float, maximum: float, nominal: str) -> None:
+        value = measurements.get(field)
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            checks.append({"name": name, "status": "unknown", "value": value, "reason": "missing or non-finite measurement"})
+        elif minimum <= value <= maximum:
+            checks.append({"name": name, "status": "ok", "value": value, "unit": "V", "expected": nominal})
+        else:
+            checks.append(
+                {
+                    "name": name,
+                    "status": "warning",
+                    "value": value,
+                    "unit": "V",
+                    "expected": nominal,
+                    "reason": f"outside conservative range {minimum:.1f}..{maximum:.1f} V",
+                }
+            )
+
+    bounded_check("tool_tvcc", "tvcc_v", 3.0, 3.6, "nominal 3.3 V")
+    bounded_check("tool_usb_supply", "usb_5v", 4.5, 5.5, "nominal 5.0 V")
+
+    ntc_c = measurements.get("ntc_c")
+    if isinstance(ntc_c, (int, float)) and math.isfinite(ntc_c) and -40 <= ntc_c <= 125:
+        checks.append({"name": "tool_ntc_temperature", "status": "ok", "value": ntc_c, "unit": "C"})
+    else:
+        checks.append(
+            {
+                "name": "tool_ntc_temperature",
+                "status": "unknown",
+                "value": ntc_c,
+                "reason": "outside sensor operating range; commonly indicates an unconnected or unavailable NTC sensor",
+            }
+        )
+
+    warnings = [check for check in checks if check["status"] == "warning"]
+    unknown = [check for check in checks if check["status"] == "unknown"]
+    overall = "warning" if warnings else "ok"
+    return {
+        "overall": overall,
+        "device": {
+            "uid": status.get("device_id_hex"),
+            "hardware_model_hex": f"0x{int(status['hardware_model']):04X}" if isinstance(status.get("hardware_model"), int) else None,
+            "app_version": status.get("app_version"),
+        },
+        "checks": checks,
+        "observations": {
+            "target_facing_measurements": {
+                name: measurements.get(name)
+                for name in ("ch1_v", "ch2_v", "high_side_v", "high_side_a", "external_power_v")
+            },
+            "gpio_inputs_bits": status.get("gpio_inputs_bits"),
+            "gpio_outputs_bits": status.get("gpio_outputs_bits"),
+        },
+        "warning_count": len(warnings),
+        "unknown_count": len(unknown),
+        "safety": "Read-only assessment. No target or H7-TOOL setting was changed.",
+    }
+
+
 def list_windows_serial_ports() -> list[dict[str, Any]]:
     if os.name != "nt":
         return []
@@ -703,6 +776,12 @@ class H7ToolMcp:
     def read_lua_health(self) -> dict[str, Any]:
         return LegacyH7ToolLuaSerialAdapter(self.config["adapter"]).run_health_script()
 
+    def health_summary(self) -> dict[str, Any]:
+        if self.adapter.kind not in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
+            raise BridgeError("health_summary requires adapter.type = modbus_tcp, modbus_udp, or h7tool_hid")
+        status = self.read_modbus_status()
+        return {"transport": status["transport"], "data": summarize_h7tool_health(status["data"])}
+
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "bridge_status":
             return self.status()
@@ -712,6 +791,8 @@ class H7ToolMcp:
             if self.adapter.kind == "h7tool_lua_serial":
                 return self.read_lua_health()
             return self.run_configured_command("status", arguments)
+        if name == "health_summary":
+            return self.health_summary()
         if name == "tool_registers":
             if self.adapter.kind not in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
                 raise BridgeError("tool_registers requires adapter.type = modbus_tcp, modbus_udp, or h7tool_hid")
@@ -748,6 +829,11 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "tool_status",
         "description": "Read H7-TOOL status. With adapter.type=h7tool_lua_serial, runs only the bundled read-only health Lua script; other adapters require a configured verified command.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "health_summary",
+        "description": "Produce a conservative read-only H7-TOOL health assessment: UID, versions, internal supply rails, NTC availability, target-facing observations, and warnings.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -871,6 +957,26 @@ def self_test(_server: H7ToolMcp) -> int:
     sample = bytes.fromhex("01 64 00 00 00")
     assert LegacyH7ToolLuaSerialAdapter._frame_length(bytearray(sample)) == 5
     assert LegacyH7ToolLuaSerialAdapter._frame_length(bytearray(b"\x01\x61\x00\x00\x03abc")) == 10
+    summary = summarize_h7tool_health(
+        {
+            "device_id_hex": "TEST",
+            "hardware_model": 0x0752,
+            "app_version": "2.33",
+            "gpio_inputs_bits": "0x00000000",
+            "gpio_outputs_bits": "0x00000000",
+            "measurements": {
+                "tvcc_v": 3.3,
+                "usb_5v": 5.0,
+                "ntc_c": -100.0,
+                "ch1_v": 0.0,
+                "ch2_v": 0.0,
+                "high_side_v": 0.0,
+                "high_side_a": 0.0,
+                "external_power_v": 0.0,
+            },
+        }
+    )
+    assert summary["overall"] == "ok" and summary["unknown_count"] == 1
     try:
         server.call_tool("read_memory", {"address": "0x20000000", "length": 4096})
     except BridgeError:
@@ -894,6 +1000,7 @@ def main() -> int:
     parser.add_argument("--list-hid-devices", action="store_true", help="List matching H7-TOOL USB HID interfaces and exit")
     parser.add_argument("--self-test", action="store_true", help="Test MCP logic using only the built-in mock adapter")
     parser.add_argument("--probe-h7tool", action="store_true", help="Run the configured read-only tool_status probe and print JSON")
+    parser.add_argument("--health-summary", action="store_true", help="Run the configured conservative read-only health assessment and print JSON")
     parser.add_argument("--tool-registers", nargs=2, metavar=("ADDRESS", "COUNT"), help="Read bounded H7-TOOL holding registers through the configured Modbus adapter")
     args = parser.parse_args()
     if args.list_serial_ports:
@@ -909,6 +1016,13 @@ def main() -> int:
     if args.probe_h7tool:
         try:
             print(json.dumps(server.call_tool("tool_status", {}), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.health_summary:
+        try:
+            print(json.dumps(server.call_tool("health_summary", {}), ensure_ascii=False, indent=2))
             return 0
         except BridgeError as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
