@@ -1,7 +1,7 @@
 {
   "adapter": {
     "type": "h7tool_lua_serial",
-    "port": "COM16",
+    "port": "COM1",
     "baudrate": 115200,
     "timeout_ms": 4000,
     "settle_ms": 200

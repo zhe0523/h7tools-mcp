@@ -2,95 +2,164 @@
 
 [中文说明](README.zh-CN.md)
 
-This project provides an MCP server for using H7-TOOL as an assisted embedded-development tool. It helps an AI client inspect the tool, search the local H7-TOOL device library, identify a connected target, and collect useful development diagnostics.
+This project provides a local MCP server for H7-TOOL. After it is enabled in an AI client, the AI can call H7-TOOL-related tools to inspect the connected programmer, search the local device library, identify a target board, and read development diagnostics.
 
-The implementation is designed around the H7-TOOL files already present in a normal PC software package. It does not publish private transport details or require users to understand the underlying communication framing.
+The public documentation only covers installation and usage. Product-internal communication details are intentionally not documented here.
 
-## Features
+## What It Does
 
-- List H7-TOOL connection candidates and local bridge configuration.
-- Read H7-TOOL status and produce a compact health summary.
-- Search the local H7-TOOL device library by vendor, series, or chip name.
-- Parse device Lua profiles for interface type, expected ID, UID location, memory ranges, included libraries, and algorithm entries.
-- Summarize device-profile capabilities, including development-useful operations and operations that should be treated carefully.
-- Probe a connected STM32H7 target and combine the live result with a selected local profile.
-- Read bounded target memory ranges for diagnostics.
-- Read option-byte values from addresses described by a selected local profile.
-- Summarize protection status when the selected profile provides the required check rules.
+- Lists available H7-TOOL USB interfaces and local bridge settings.
+- Reads H7-TOOL status and health information.
+- Searches the local H7-TOOL device Lua library by vendor, series, or chip name.
+- Parses device profiles for interface type, expected ID, UID location, memory ranges, included libraries, and algorithm entries.
+- Summarizes profile capabilities so the AI can understand what a chip profile appears to support.
+- Probes a connected STM32H7 target and combines live results with the selected local profile.
+- Reads bounded target memory ranges for diagnostics.
+- Reads option-byte values described by a selected local profile.
+- Summarizes protection status when the selected profile provides the required rules.
 
-## Requirements
+## Directory Layout
 
-- Python 3.11+.
-- H7-TOOL PC software package with its `EMMC/H7-TOOL` directory available beside this project.
-- Optional Python packages from `requirements.txt` for USB HID or serial access.
+Recommended layout:
 
-Install dependencies:
-
-```powershell
-python -m pip install -r requirements.txt
+```text
+h7toolPC_release/
+  EMMC/
+    H7-TOOL/
+      Programmer/
+        Device/
+  mcp/
+    h7tool_mcp.py
+    README.md
+    requirements.txt
+    config.json
 ```
 
-Run self-test:
+In other words, place or clone this repository as the `mcp` directory under the H7-TOOL PC software package root, beside `EMMC`.
+
+Example:
 
 ```powershell
+cd D:\Tools\h7toolPC_release
+git clone https://github.com/zhe0523/h7tools-mcp.git mcp
+```
+
+This layout lets the MCP server find the H7-TOOL device library automatically.
+
+## Install
+
+Use Python 3.11 or newer.
+
+```powershell
+cd D:\Tools\h7toolPC_release\mcp
+python -m pip install -r requirements.txt
 python h7tool_mcp.py --self-test
 ```
 
-## Common Commands
+If the self-test prints `Self-test passed`, the Python side is working.
 
-List visible H7-TOOL USB interfaces:
+## Configure H7-TOOL Access
+
+Create a local `config.json` from the example that matches your connection method. The most common current path is USB HID:
 
 ```powershell
+copy config.usb-hid.example.json config.json
 python h7tool_mcp.py --list-hid-devices
 ```
 
-Inspect local device-library support:
+If more than one matching H7-TOOL interface is found, copy the correct `serial_number` into `config.json`.
+
+Useful local checks:
 
 ```powershell
 python h7tool_mcp.py --device-vendors
 python h7tool_mcp.py --device-search STM32H743 --device-vendor ST
 python h7tool_mcp.py --device-profile ST/STM32H7xx/STM32H7x_2M.lua
-python h7tool_mcp.py --device-capabilities ST/STM32H7xx/STM32H7x_2M.lua
+python h7tool_mcp.py --lua-health
+python h7tool_mcp.py --target-identity ST/STM32H7xx/STM32H7x_2M.lua
 ```
 
-Run target diagnostics after configuring `config.json`:
+`config.json` is intentionally ignored by git because it contains local device settings.
+
+## Start The MCP Server
+
+The MCP server uses stdio. Usually you do not start it manually; your AI client starts it with this command:
 
 ```powershell
-python h7tool_mcp.py --probe-h7tool
-python h7tool_mcp.py --health-summary
-python h7tool_mcp.py --target-identity ST/STM32H7xx/STM32H7x_2M.lua
-python h7tool_mcp.py --read-memory 0x1FF1E800 12
-python h7tool_mcp.py --read-option-bytes ST/STM32H7xx/STM32H7x_2M.lua
-python h7tool_mcp.py --protection-status ST/STM32H7xx/STM32H7x_2M.lua
+python D:\Tools\h7toolPC_release\mcp\h7tool_mcp.py
 ```
 
-## MCP Configuration
+For manual command-line checks, use one of the flags shown by:
 
-Example:
+```powershell
+python h7tool_mcp.py --help
+```
+
+When no flag is provided, the program waits for MCP JSON-RPC messages on stdin/stdout, which is what MCP clients expect.
+
+## Connect From AI Tools
+
+Use an absolute path to `h7tool_mcp.py`.
+
+### Codex / ChatGPT Desktop / Codex IDE
+
+Open the Codex MCP settings and add a stdio server, or edit `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.h7tool]
+command = "python"
+args = ["D:\\Tools\\h7toolPC_release\\mcp\\h7tool_mcp.py"]
+enabled = true
+```
+
+Codex also supports project-level MCP config in `.codex/config.toml` for trusted projects. After adding the server, restart or reload the AI client if it does not appear immediately.
+
+### Claude Desktop And Other JSON-Based MCP Clients
+
+Add a server entry like this:
 
 ```json
 {
   "mcpServers": {
     "h7tool": {
       "command": "python",
-      "args": ["C:\\path\\to\\h7tools-mcp\\h7tool_mcp.py"]
+      "args": ["D:\\Tools\\h7toolPC_release\\mcp\\h7tool_mcp.py"]
     }
   }
 }
 ```
 
-Use an absolute path that matches your local checkout.
+After saving the config, restart the client. The server name can be any friendly name; `h7tool` is recommended.
 
-## Configuration Files
+## How To Ask The AI To Use It
 
-`config.json` is local and should not be committed. Start from one of the example files:
+Once the MCP server is connected, ask the AI to use the H7-TOOL tools directly. Example prompts:
 
-- `config.usb-hid.example.json`
-- `config.modbus-udp.example.json`
-- `config.modbus-tcp.example.json`
-- `config.usb-lua.example.json`
+```text
+Use the h7tool MCP server to list available H7-TOOL interfaces.
+```
 
-## MCP Tools
+```text
+Use h7tool to search the local device library for STM32H743.
+```
+
+```text
+Use h7tool target_identity with ST/STM32H7xx/STM32H7x_2M.lua and summarize the connected target.
+```
+
+```text
+Use h7tool protection_status for the selected STM32H7 profile and explain the result.
+```
+
+Good workflow:
+
+1. Ask the AI to check `bridge_status`.
+2. Ask it to search or inspect the target device profile.
+3. Ask it to run `lua_health` or `health_summary`.
+4. Ask it to run `target_identity`.
+5. Ask for focused reads or summaries only after the target profile is selected.
+
+## Available MCP Tools
 
 - `bridge_status`
 - `device_vendors`
@@ -110,11 +179,6 @@ Use an absolute path that matches your local checkout.
 
 ## Notes
 
-Device scripts in the H7-TOOL package often describe whole chip families rather than a single exact part number. For example, searching for `STM32H743` may return a generic H7 profile. Use live target data, profile metadata, and chip-specific registers together when exact identification matters.
+Device scripts in the H7-TOOL package often describe whole chip families rather than one exact part number. For example, searching for `STM32H743` may return a generic STM32H7 profile. Use live target data, profile metadata, and chip-specific registers together when exact identification matters.
 
-## Suggested Next Steps
-
-- Improve exact chip-size identification for STM32 families.
-- Generalize target probing so it can be generated from more device profiles.
-- Add friendly summaries for option bytes and protection state.
-- Explore RTT, UART, and CAN assistant features after their public-facing behavior is understood.
+Only one program should actively control the same H7-TOOL operation path at a time. If an AI call times out or returns an unexpected result, close conflicting operations in the PC tool and try again.

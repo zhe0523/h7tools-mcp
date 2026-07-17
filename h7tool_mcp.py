@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""A deliberately read-only MCP bridge for H7-TOOL diagnostics.
+"""A local MCP assistant server for H7-TOOL development workflows.
 
-The device protocol is not assumed or reverse engineered here.  Commands are
-provided by the operator in a local JSON configuration after they have been
-verified against vendor documentation or a controlled manual test.
+The server exposes H7-TOOL status, local device-library search, target
+identification, and focused diagnostic reads to MCP-compatible AI clients.
 """
 
 from __future__ import annotations
@@ -1410,7 +1409,7 @@ class H7ToolMcp:
     def status(self) -> dict[str, Any]:
         return {
             "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
-            "safety": "read-only; no flash, erase, power, reset, or protection tools are exposed",
+        "safety": "development-assistant mode; flash, erase, power, reset, and protection-changing actions are not exposed as MCP tools",
             "adapter": self.adapter.kind,
             "config_path": str(self.config_path),
             "configured_commands": sorted(self.config["commands"].keys()),
@@ -1683,7 +1682,7 @@ class H7ToolMcp:
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "bridge_status",
-        "description": "Show bridge configuration, available serial ports/H7-TOOL HID interfaces, and the read-only safety policy. Does not contact H7-TOOL.",
+        "description": "Show bridge configuration and available serial ports/H7-TOOL HID interfaces. Does not contact H7-TOOL.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -1721,7 +1720,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "device_capabilities",
-        "description": "Inspect one local H7-TOOL device Lua profile plus included device libraries and summarize inferred read-only and dangerous capabilities. Pure filesystem analysis; no hardware access.",
+        "description": "Inspect one local H7-TOOL device Lua profile plus included device libraries and summarize inferred capabilities. Pure filesystem analysis; no hardware access.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1735,27 +1734,27 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "tool_status",
-        "description": "Read H7-TOOL status. With adapter.type=h7tool_lua_serial, runs only the bundled read-only health Lua script; other adapters require a configured verified command.",
+        "description": "Read H7-TOOL status. With adapter.type=h7tool_lua_serial, runs the bundled health Lua script; other adapters require a configured verified command.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "health_summary",
-        "description": "Produce a conservative read-only H7-TOOL health assessment: UID, versions, internal supply rails, NTC availability, target-facing observations, and warnings.",
+        "description": "Produce an H7-TOOL health assessment: UID, versions, internal supply rails, NTC availability, target-facing observations, and warnings.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "lua_health",
-        "description": "Run only the bundled read-only diagnostics/tool_health.lua over the verified H7-TOOL HID Communication interface and return its print output.",
+        "description": "Run the bundled diagnostics/tool_health.lua over the configured H7-TOOL HID interface and return its print output.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "target_probe",
-        "description": "Run a read-only target probe. With adapter.type=h7tool_hid, executes only the bundled STM32H7 UID probe script over HID.",
+        "description": "Run a target probe. With adapter.type=h7tool_hid, executes the bundled STM32H7 UID probe script over HID.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "target_identity",
-        "description": "Build a read-only target identity profile by combining selected local H7-TOOL device Lua metadata with the verified HID STM32H7 UID probe. Selection accepts relative_path or vendor/series/device; omitted uses config/default profile.",
+        "description": "Build a target identity profile by combining selected local H7-TOOL device Lua metadata with the live STM32H7 UID probe. Selection accepts relative_path or vendor/series/device; omitted uses config/default profile.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1782,7 +1781,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "read_option_bytes",
-        "description": "Read option-byte addresses from the selected local device profile over verified HID Lua pg_read_mem. Read-only; no option-byte programming, protection changes, erase, reset, or power control.",
+        "description": "Read option-byte addresses from the selected local device profile over the configured HID Lua path.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1810,7 +1809,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "log_tail",
-        "description": "Read a bounded UART, RTT, or CAN log window through a configured read-only command.",
+        "description": "Read a bounded UART, RTT, or CAN log window through a configured command.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1823,7 +1822,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "read_memory",
-        "description": "Read a bounded target memory range. With adapter.type=h7tool_hid, uses a generated read-only Lua pg_read_mem template; other adapters require a configured read-only command.",
+        "description": "Read a bounded target memory range. With adapter.type=h7tool_hid, uses a generated Lua memory-read template; other adapters require a configured command.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1867,7 +1866,7 @@ def handle_request(server: H7ToolMcp, request: dict[str, Any]) -> dict[str, Any]
                     "protocolVersion": protocol_version,
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                    "instructions": "Read-only diagnostic bridge. Configure only verified H7-TOOL commands before requesting hardware data.",
+                    "instructions": "H7-TOOL development-assistant bridge. Configure verified H7-TOOL access before requesting hardware data.",
                 },
             )
         if method == "tools/list":
@@ -2013,13 +2012,13 @@ def main() -> int:
     parser.add_argument("--device-vendor", metavar="VENDOR", help="Restrict --device-search to one vendor")
     parser.add_argument("--include-libraries", action="store_true", help="Include shared Lib scripts in --device-search results")
     parser.add_argument("--device-profile", metavar="RELATIVE_PATH", help="Parse one local H7-TOOL device Lua profile")
-    parser.add_argument("--device-capabilities", metavar="RELATIVE_PATH", help="Inspect one local H7-TOOL device Lua profile for read-only and dangerous capabilities")
+    parser.add_argument("--device-capabilities", metavar="RELATIVE_PATH", help="Inspect one local H7-TOOL device Lua profile and summarize inferred capabilities")
     parser.add_argument("--self-test", action="store_true", help="Test MCP logic using only the built-in mock adapter")
-    parser.add_argument("--probe-h7tool", action="store_true", help="Run the configured read-only tool_status probe and print JSON")
-    parser.add_argument("--health-summary", action="store_true", help="Run the configured conservative read-only health assessment and print JSON")
-    parser.add_argument("--lua-health", action="store_true", help="Run the bundled read-only Lua health script through the configured HID adapter")
-    parser.add_argument("--target-probe", action="store_true", help="Run the configured read-only target probe and print JSON")
-    parser.add_argument("--target-identity", nargs="?", const="", metavar="RELATIVE_PATH", help="Run the read-only target identity profile; optionally select a local device Lua relative path")
+    parser.add_argument("--probe-h7tool", action="store_true", help="Run the configured tool_status probe and print JSON")
+    parser.add_argument("--health-summary", action="store_true", help="Run the configured H7-TOOL health assessment and print JSON")
+    parser.add_argument("--lua-health", action="store_true", help="Run the bundled Lua health check through the configured HID adapter")
+    parser.add_argument("--target-probe", action="store_true", help="Run the configured target probe and print JSON")
+    parser.add_argument("--target-identity", nargs="?", const="", metavar="RELATIVE_PATH", help="Build the target identity profile; optionally select a local device Lua relative path")
     parser.add_argument("--read-option-bytes", nargs="?", const="", metavar="RELATIVE_PATH", help="Read option bytes using a selected local device Lua profile")
     parser.add_argument("--protection-status", nargs="?", const="", metavar="RELATIVE_PATH", help="Read and summarize protection status using a selected local device Lua profile")
     parser.add_argument("--read-memory", nargs=2, metavar=("ADDRESS", "LENGTH"), help="Read a bounded target memory range through the configured adapter")

@@ -1,7 +1,7 @@
 {
   "adapter": {
     "type": "modbus_tcp",
-    "host": "192.168.1.6",
+    "host": "192.168.1.100",
     "port": 8080,
     "unit_id": 1,
     "timeout_ms": 1000

@@ -1,9 +1,9 @@
 {
   "adapter": {
     "type": "mock",
-    "host": "192.168.0.101",
+    "host": "192.168.1.100",
     "port": 8080,
-    "serial_port": "COM16",
+    "serial_port": "COM1",
     "baudrate": 115200,
     "timeout_ms": 1000,
     "line_ending": "\r\n"
