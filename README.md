@@ -132,6 +132,12 @@ Add a server entry like this:
 
 After saving the config, restart the client. The server name can be any friendly name; `h7tool` is recommended.
 
+### Cherry Studio
+
+In Cherry Studio, open `Settings -> MCP Server -> Add server`, choose `STDIO`, then set the command to `py` or `python` and the parameters to the absolute path of `h7tool_mcp.py`.
+
+Chinese step-by-step guide: [Cherry Studio 配置 H7-TOOL MCP 教程](docs/cherry-studio.zh-CN.md).
+
 ## How To Ask The AI To Use It
 
 Once the MCP server is connected, ask the AI to use the H7-TOOL tools directly. Example prompts:
