@@ -17,6 +17,11 @@ The public documentation only covers installation and usage. Product-internal co
 - Reads bounded target memory ranges for diagnostics.
 - Reads option-byte values described by a selected local profile.
 - Summarizes protection status when the selected profile provides the required rules.
+- Sends and receives short data through H7-TOOL UART channels for loopback tests, AT commands, and simple serial debugging.
+- Sends bounded CAN/CAN-FD frames through H7-TOOL.
+- Scans I2C addresses or performs one bounded I2C write/read transaction.
+- Performs one bounded SPI write/read transaction with CS0 or CS1.
+- Attempts to read SEGGER RTT up-buffer logs from target firmware.
 
 ## Directory Layout
 
@@ -85,11 +90,15 @@ python h7tool_mcp.py --target-flash-info ST/STM32H7xx/STM32H7x_2M.lua
 
 ## Start The MCP Server
 
-The MCP server uses stdio. Usually you do not start it manually; your AI client starts it with this command:
+The MCP server uses stdio. Usually you do not start it manually; your AI client starts it.
 
-```powershell
-python D:\Tools\h7toolPC_release\mcp\h7tool_mcp.py
+On Windows, prefer the launcher script:
+
+```text
+D:\Tools\h7toolPC_release\mcp\h7tool_mcp.cmd
 ```
+
+Replace the path with the absolute path on your machine. The launcher avoids many client-specific differences around Python launchers, argument splitting, non-ASCII paths, and paths containing spaces.
 
 For manual command-line checks, use one of the flags shown by:
 
@@ -101,7 +110,33 @@ When no flag is provided, the program waits for MCP JSON-RPC messages on stdin/s
 
 ## Connect From AI Tools
 
-Use an absolute path to `h7tool_mcp.py`.
+Configure this repository's `h7tool_mcp.cmd` as a local stdio MCP server.
+
+Before connecting an AI client, verify the server from a terminal:
+
+```powershell
+cd D:\Tools\h7toolPC_release\mcp
+.\h7tool_mcp.cmd --self-test
+.\h7tool_mcp.cmd --lua-health
+```
+
+Then verify any hardware workflow you plan to expose to the AI:
+
+```powershell
+.\h7tool_mcp.cmd --target-summary ST/STM32H7xx/STM32H7x_2M.lua --include-protection-status
+.\h7tool_mcp.cmd --uart-transact --uart-channel 1 --uart-baud 115200 --uart-send-hex "48 37 0D 0A" --uart-rx-length 64
+.\h7tool_mcp.cmd --i2c-transact --i2c-clock 100000 --i2c-scan
+.\h7tool_mcp.cmd --spi-transact --spi-freq-id 0 --spi-cs 0 --spi-write-hex "9F" --spi-read-length 3
+```
+
+Most AI clients need the same fields:
+
+- Name: `h7tool`
+- Type: `stdio`
+- Command: `D:\Tools\h7toolPC_release\mcp\h7tool_mcp.cmd`
+- Arguments: empty
+
+If a client cannot launch `.cmd` directly, use `cmd` as the command and `/c D:\Tools\h7toolPC_release\mcp\h7tool_mcp.cmd` as the arguments.
 
 ### Codex / ChatGPT Desktop / Codex IDE
 
@@ -109,37 +144,37 @@ Open the Codex MCP settings and add a stdio server, or edit `~/.codex/config.tom
 
 ```toml
 [mcp_servers.h7tool]
-command = "python"
-args = ["D:\\Tools\\h7toolPC_release\\mcp\\h7tool_mcp.py"]
+command = 'D:\Tools\h7toolPC_release\mcp\h7tool_mcp.cmd'
+args = []
 enabled = true
+startup_timeout_sec = 20
+tool_timeout_sec = 60
 ```
 
-Codex also supports project-level MCP config in `.codex/config.toml` for trusted projects. After adding the server, restart or reload the AI client if it does not appear immediately.
+You can also add it with Codex CLI:
 
-### Claude Desktop And Other JSON-Based MCP Clients
-
-Add a server entry like this:
-
-```json
-{
-  "mcpServers": {
-    "h7tool": {
-      "command": "python",
-      "args": ["D:\\Tools\\h7toolPC_release\\mcp\\h7tool_mcp.py"]
-    }
-  }
-}
+```powershell
+codex mcp add h7tool -- D:\Tools\h7toolPC_release\mcp\h7tool_mcp.cmd
+codex mcp list
 ```
 
-After saving the config, restart the client. The server name can be any friendly name; `h7tool` is recommended.
+After adding the server, restart or reload the AI client if it does not appear immediately. Ask the AI to call `bridge_status` to confirm the connection.
 
 ### Cherry Studio
 
-In Cherry Studio, open `Settings -> MCP Server -> Add server`, choose `STDIO`, then set the command to the absolute path of `h7tool_mcp.cmd` and leave parameters empty.
+In Cherry Studio, open `Settings -> MCP Server -> Add server`, choose `STDIO`, then set:
+
+```text
+Name: h7tool
+Command: D:\Tools\h7toolPC_release\mcp\h7tool_mcp.cmd
+Arguments: empty
+```
 
 Chinese step-by-step guide: [Cherry Studio 配置 H7-TOOL MCP 教程](docs/cherry-studio.zh-CN.md).
 
-Chinese multi-client guide: [AI 客户端接入 H7-TOOL MCP 指南](docs/ai-clients.zh-CN.md).
+### Claude Code / Claude Desktop / opencode
+
+These clients use the same local stdio MCP idea. Chinese multi-client guide: [AI 客户端接入 H7-TOOL MCP 指南](docs/ai-clients.zh-CN.md).
 
 ## How To Ask The AI To Use It
 
@@ -170,7 +205,19 @@ Use h7tool uart_transact on channel 1, 115200 8N1, send hex: 48 37 0D 0A, and re
 ```
 
 ```text
+Use h7tool can_transact at 500K bitrate to send standard frame ID 0x321 with data 01 02 03 04.
+```
+
+```text
+Use h7tool i2c_transact to scan I2C addresses at 100K clock.
+```
+
+```text
 Use h7tool spi_transact with freq_id 0, phase 0, polarity 0, CS0, send hex 9F, and read 3 bytes.
+```
+
+```text
+Use h7tool rtt_read to try reading target RTT channel 0 logs.
 ```
 
 Good workflow:
@@ -179,7 +226,7 @@ Good workflow:
 2. Ask it to search or inspect the target device profile.
 3. Ask it to run `lua_health` or `health_summary`.
 4. Ask it to run `target_summary`.
-5. Ask for focused reads or summaries only after the target profile is selected.
+5. Ask for focused memory, option-byte, RTT, or peripheral transactions only after the target profile is selected.
 
 ## Available MCP Tools
 
