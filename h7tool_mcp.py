@@ -29,6 +29,7 @@ SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
 DEVICE_ROOT = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL" / "Programmer" / "Device"
 DEFAULT_TARGET_LUA = DEVICE_ROOT / "ST" / "STM32H7xx" / "STM32H7x_2M.lua"
+DEFAULT_RTT_RANGES = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL" / "Config" / "rtt_address.txt"
 
 
 class BridgeError(Exception):
@@ -191,6 +192,107 @@ def parse_uart_transact_output(raw: bytes) -> dict[str, Any]:
     return {"raw": text, "format": "h7tool_uart_transact", "data": data}
 
 
+def parse_rtt_read_output(raw: bytes) -> dict[str, Any]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    data: dict[str, Any] = {}
+    hex_chunks: list[tuple[int, list[str]]] = []
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        key_match = re.search(r"([A-Za-z_][A-Za-z0-9_\[\]]*)$", key)
+        if key_match:
+            key = key_match.group(1)
+        if key in {
+            "found",
+            "channel",
+            "max_up_buffers",
+            "max_down_buffers",
+            "buffer_address",
+            "buffer_size",
+            "write_offset",
+            "read_offset",
+            "available",
+            "read_len",
+            "new_read_offset",
+            "consume",
+            "consume_written",
+        }:
+            data[key] = _parse_lua_number(value)
+        elif key in {"control_block", "name_address", "flags"}:
+            data[key] = value.upper().replace("X", "x") if value.lower().startswith("0x") else value
+        else:
+            match = re.fullmatch(r"rtt_hex\[(\d+)\]", key)
+            if match:
+                hex_chunks.append((int(match.group(1)), [part.upper() for part in value.split() if part]))
+            else:
+                data[key] = value
+    rtt_bytes: list[str] = []
+    for _offset, parts in sorted(hex_chunks, key=lambda item: item[0]):
+        rtt_bytes.extend(parts)
+    if rtt_bytes:
+        data["rtt_hex"] = " ".join(rtt_bytes)
+        data["rtt_bytes"] = rtt_bytes
+        try:
+            data["rtt_text"] = bytes.fromhex("".join(rtt_bytes)).decode("utf-8", errors="replace")
+        except ValueError:
+            data["rtt_text"] = ""
+    elif data.get("read_len") == 0:
+        data["rtt_hex"] = ""
+        data["rtt_bytes"] = []
+        data["rtt_text"] = ""
+    data["ok"] = data.get("found") == 1 and isinstance(data.get("read_len"), int)
+    return {"raw": text, "format": "h7tool_rtt_read", "data": data}
+
+
+def parse_rtt_scan_output(raw: bytes) -> dict[str, Any]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    data: dict[str, Any] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        key_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)$", key)
+        if key_match:
+            key = key_match.group(1)
+        if key == "found":
+            data[key] = _parse_lua_number(value)
+        elif key == "control_block":
+            data[key] = value.upper().replace("X", "x") if value.lower().startswith("0x") else value
+        else:
+            data[key] = value
+    data["ok"] = data.get("found") == 1 and isinstance(data.get("control_block"), str)
+    return {"raw": text, "format": "h7tool_rtt_scan", "data": data}
+
+
+def default_rtt_search_ranges() -> list[dict[str, int]]:
+    ranges: list[dict[str, int]] = []
+    try:
+        text = DEFAULT_RTT_RANGES.read_text(encoding="utf-8")
+    except OSError:
+        return [
+            {"address": 0x20000000, "length": 0x40000},
+            {"address": 0x24000000, "length": 0x80000},
+            {"address": 0x30000000, "length": 0x40000},
+        ]
+    for line in text.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            address = int(parts[0], 0)
+            length = int(parts[1], 0)
+        except ValueError:
+            continue
+        if 0 <= address <= 0xFFFFFFFF and 1 <= length <= 0x200000:
+            ranges.append({"address": address, "length": length})
+    return ranges
+
+
 def parse_hex_bytes(value: str) -> bytes:
     cleaned = re.sub(r"[^0-9A-Fa-f]", "", value)
     if not cleaned:
@@ -218,6 +320,10 @@ def lua_string_literal(data: bytes) -> str:
 
 
 def _parse_lua_number(value: str) -> int | str:
+    try:
+        return int(value, 0)
+    except ValueError:
+        pass
     try:
         return int(float(value))
     except ValueError:
@@ -1634,6 +1740,114 @@ print("H7TOOL_UART_END")
         result["result"] = parse_uart_transact_output(result["result"]["raw"].encode("utf-8", errors="replace"))
         return result
 
+    def run_rtt_read_script(
+        self,
+        control_block_address: int | None,
+        ranges: list[dict[str, int]],
+        channel: int,
+        max_bytes: int,
+        consume: bool,
+    ) -> dict[str, Any]:
+        if control_block_address is None:
+            lua_ranges = ",".join(f"{{0x{item['address']:08X},0x{item['length']:X}}}" for item in ranges)
+            scan_script = f"""print("H7TOOL_RTT_SCAN_BEGIN")
+local R={{{lua_ranges}}};local S="SEGGER RTT";local O=#S-1
+if pg_init then pg_init() end
+for i=1,#R do local p=0;local v="";while p<R[i][2] do local n=512;if p+n>R[i][2] then n=R[i][2]-p end;local o,b=pg_read_mem(R[i][1]+p,n);if o==1 and b then local x=v..b;local a=string.find(x,S,1,true);if a then print("found=1");print(string.format("control_block=0x%08X",R[i][1]+p-#v+a-1));print("H7TOOL_RTT_SCAN_END");return end;if #x>O then v=string.sub(x,#x-O+1) else v=x end else v="" end;p=p+n end end
+print("found=0")
+print("H7TOOL_RTT_SCAN_END")
+""".encode("ascii")
+            scan = self._run_lua_script(scan_script, "generated/rtt_scan.lua", b"H7TOOL_RTT_SCAN_BEGIN", b"H7TOOL_RTT_SCAN_END")
+            scan["result"] = parse_rtt_scan_output(scan["result"]["raw"].encode("utf-8", errors="replace"))
+            scan_data = scan["result"]["data"]
+            if scan_data.get("found") != 1:
+                scan["result"] = parse_rtt_read_output(scan["result"]["raw"].encode("utf-8", errors="replace"))
+                return scan
+            control_block_text = str(scan_data["control_block"])
+            control_block_address = int(control_block_text, 16)
+        consume_flag = 1 if consume else 0
+        descriptor_script = (
+            f'P=print;F=string.format;C=0x{control_block_address:08X};H={channel};P("RB");'
+            'function U(o)return(B:byte(o)or 0)+(B:byte(o+1)or 0)*256+(B:byte(o+2)or 0)*65536+(B:byte(o+3)or 0)*16777216 end;'
+            'if pg_init then pg_init()end;o,B=pg_read_mem(C,24);'
+            'if o~=1 or B==nil or B:sub(1,10)~="SEGGER RTT"then P("found=0");P(F("control_block=0x%08X",C));P("read_len=0");P("RE");return end;'
+            'P("found=1");P(F("control_block=0x%08X",C));M=U(17);P("max_up_buffers="..M);P("max_down_buffers="..U(21));P("channel="..H);'
+            'if H>=M then P("read_len=0");P("RE");return end;o,B=pg_read_mem(C+24+H*24,24);'
+            'if o~=1 or B==nil then P("read_len=0");P("RE");return end;'
+            'P(F("name_address=0x%08X",U(1)));P(F("buffer_address=0x%08X",U(5)));P("buffer_size="..U(9));P("write_offset="..U(13));P("read_offset="..U(17));P(F("flags=0x%08X",U(21)));P("RE")'
+        ).encode("ascii")
+        descriptor = self._run_lua_script(descriptor_script, "generated/rtt_descriptor.lua", b"RB", b"RE")
+        descriptor["result"] = parse_rtt_read_output(descriptor["result"]["raw"].encode("utf-8", errors="replace"))
+        data = dict(descriptor["result"]["data"])
+        buffer_address = data.get("buffer_address")
+        buffer_size = data.get("buffer_size")
+        write_offset = data.get("write_offset")
+        read_offset = data.get("read_offset")
+        if not all(isinstance(item, int) for item in (buffer_address, buffer_size, write_offset, read_offset)):
+            data.setdefault("available", 0)
+            data.setdefault("read_len", 0)
+            data["ok"] = False
+            descriptor["result"]["data"] = data
+            return descriptor
+        if buffer_size == 0 or buffer_address == 0 or write_offset >= buffer_size or read_offset >= buffer_size:
+            data["available"] = 0
+            data["read_len"] = 0
+            data["rtt_hex"] = ""
+            data["rtt_bytes"] = []
+            data["rtt_text"] = ""
+            data["ok"] = True
+            descriptor["result"]["data"] = data
+            return descriptor
+        available = write_offset - read_offset if write_offset >= read_offset else buffer_size - read_offset + write_offset
+        read_len = min(available, max_bytes)
+        first_len = min(read_len, buffer_size - read_offset)
+        second_len = read_len - first_len
+        byte_parts: list[str] = []
+        memory_reads: list[dict[str, Any]] = []
+        for address, length in ((buffer_address + read_offset, first_len), (buffer_address, second_len)):
+            if length <= 0:
+                continue
+            memory = self.run_read_memory_script(address, length)
+            memory_reads.append(memory)
+            memory_data = memory["result"].get("data", {})
+            if isinstance(memory_data, dict):
+                parts = memory_data.get("data_bytes", [])
+                if isinstance(parts, list):
+                    byte_parts.extend(str(part).upper() for part in parts)
+        new_read_offset = read_offset + len(byte_parts)
+        if new_read_offset >= buffer_size:
+            new_read_offset -= buffer_size
+        data["available"] = available
+        data["read_len"] = len(byte_parts)
+        data["new_read_offset"] = new_read_offset
+        data["consume"] = consume_flag
+        data["consume_written"] = 0
+        data["rtt_hex"] = " ".join(byte_parts)
+        data["rtt_bytes"] = byte_parts
+        data["rtt_text"] = bytes.fromhex("".join(byte_parts)).decode("utf-8", errors="replace") if byte_parts else ""
+        if consume and byte_parts:
+            consume_script = f"""print("H7TOOL_RTT_CONSUME_BEGIN")
+if pg_write32 then pg_write32(0x{(control_block_address + 24 + channel * 24 + 16):08X},{new_read_offset});print("consume_written=1") else print("consume_written=0") end
+print("H7TOOL_RTT_CONSUME_END")
+""".encode("ascii")
+            consume_result = self._run_lua_script(
+                consume_script,
+                "generated/rtt_consume.lua",
+                b"H7TOOL_RTT_CONSUME_BEGIN",
+                b"H7TOOL_RTT_CONSUME_END",
+            )
+            if "consume_written=1" in consume_result["result"]["raw"]:
+                data["consume_written"] = 1
+        data["ok"] = True
+        return {
+            "transport": descriptor["transport"],
+            "script": "generated/rtt_scan.lua + generated/rtt_descriptor.lua + generated/read_memory.lua",
+            "reports": descriptor["reports"] + sum(int(item.get("reports", 0)) for item in memory_reads),
+            "descriptor": descriptor["result"],
+            "memory_reads": [item["result"] for item in memory_reads],
+            "result": {"raw": descriptor["result"]["raw"], "format": "h7tool_rtt_read", "data": data},
+        }
+
 
 class H7ToolMcp:
     def __init__(self, config: dict[str, Any], config_path: Path) -> None:
@@ -1770,6 +1984,57 @@ class H7ToolMcp:
             tx_data=tx_data,
             rx_length=rx_length,
             timeout_ms=timeout_ms,
+        )
+
+    def rtt_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        channel = int(arguments.get("channel", 0))
+        max_bytes = int(arguments.get("max_bytes", 512))
+        consume = bool(arguments.get("consume", False))
+        if not 0 <= channel <= 15:
+            raise BridgeError("channel must be between 0 and 15")
+        if not 1 <= max_bytes <= 2048:
+            raise BridgeError("max_bytes must be between 1 and 2048")
+        control_block_address = None
+        address_text = arguments.get("address")
+        if isinstance(address_text, str) and address_text.strip():
+            if not address_text.startswith("0x"):
+                raise BridgeError("address must be hexadecimal, for example 0x20000000")
+            control_block_address = int(address_text, 16)
+            if not 0 <= control_block_address <= 0xFFFFFFFF:
+                raise BridgeError("address must be a 32-bit target address")
+        ranges: list[dict[str, int]] = []
+        raw_ranges = arguments.get("ranges")
+        if isinstance(raw_ranges, list):
+            for item in raw_ranges:
+                if not isinstance(item, dict):
+                    continue
+                item_address = item.get("address")
+                item_length = item.get("length")
+                if isinstance(item_address, str):
+                    address = int(item_address, 0)
+                else:
+                    address = int(item_address)
+                if isinstance(item_length, str):
+                    length = int(item_length, 0)
+                else:
+                    length = int(item_length)
+                if not 0 <= address <= 0xFFFFFFFF or not 1 <= length <= 0x200000:
+                    raise BridgeError("each RTT search range must fit in 32-bit address space and be at most 2 MB")
+                ranges.append({"address": address, "length": length})
+        if control_block_address is None and not ranges:
+            ranges = default_rtt_search_ranges()
+        if control_block_address is None and not ranges:
+            raise BridgeError("No RTT address or search ranges are available")
+        if len(ranges) > 16:
+            raise BridgeError("Refusing to scan more than 16 RTT ranges")
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError("rtt_read currently requires adapter.type = h7tool_hid")
+        return self.hid_modbus.run_rtt_read_script(
+            control_block_address=control_block_address,
+            ranges=ranges,
+            channel=channel,
+            max_bytes=max_bytes,
+            consume=consume,
         )
 
     def read_option_bytes(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1999,6 +2264,8 @@ class H7ToolMcp:
             return self.target_flash_info(arguments)
         if name == "uart_transact":
             return self.uart_transact(arguments)
+        if name == "rtt_read":
+            return self.rtt_read(arguments)
         if name == "read_option_bytes":
             return self.read_option_bytes(arguments)
         if name == "protection_status":
@@ -2207,6 +2474,32 @@ TOOLS: list[dict[str, Any]] = [
                 "send_hex": {"type": "string", "description": "Hex byte payload such as '48 37 0D 0A'. Do not combine with send_text."},
                 "rx_length": {"type": "integer", "minimum": 0, "maximum": 1024, "default": 256},
                 "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 500},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "rtt_read",
+        "description": "Find or use a SEGGER RTT control block on the target, then read a bounded window from one up-buffer channel.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": "string", "pattern": "^0x[0-9A-Fa-f]+$", "description": "Optional known RTT control-block address."},
+                "ranges": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "address": {"type": "string", "pattern": "^0x[0-9A-Fa-f]+$"},
+                            "length": {"type": "integer", "minimum": 1, "maximum": 2097152},
+                        },
+                        "required": ["address", "length"],
+                        "additionalProperties": False,
+                    },
+                },
+                "channel": {"type": "integer", "minimum": 0, "maximum": 15, "default": 0},
+                "max_bytes": {"type": "integer", "minimum": 1, "maximum": 2048, "default": 512},
+                "consume": {"type": "boolean", "default": False, "description": "When true, advance the RTT read offset after a successful read."},
             },
             "additionalProperties": False,
         },
@@ -2431,6 +2724,14 @@ def self_test(_server: H7ToolMcp) -> int:
         pass
     else:
         raise AssertionError("UART send_text/send_hex exclusivity was not enforced")
+    rtt = parse_rtt_read_output(
+        b"H7TOOL_RTT_BEGIN\nfound=1\ncontrol_block=0x20000000\nchannel=0\nmax_up_buffers=1\n"
+        b"buffer_address=0x20001000\nbuffer_size=1024\nwrite_offset=5\nread_offset=0\navailable=5\nread_len=5\n"
+        b"rtt_hex[0]=48 65 6C 6C 6F\nnew_read_offset=5\nconsume=0\nconsume_written=0\nH7TOOL_RTT_END\n"
+    )
+    assert rtt["data"]["ok"] is True
+    assert rtt["data"]["rtt_text"] == "Hello"
+    assert default_rtt_search_ranges()
     profile = parse_lua_target_profile(
         Path("Device/ST/STM32H7xx/STM32H7x_2M.lua"),
         'CHIP_TYPE = "SWD"\nMCU_ID = 0x6BA02477\nUID_ADDR = 0x1FF1E800\nUID_BYTES = 12\n'
@@ -2566,6 +2867,11 @@ def main() -> int:
     parser.add_argument("--uart-send-hex", help="Hex byte payload for --uart-transact, for example '48 37 0D 0A'")
     parser.add_argument("--uart-rx-length", type=int, default=256, help="Maximum UART bytes to receive for --uart-transact")
     parser.add_argument("--uart-timeout-ms", type=int, default=500, help="UART receive timeout in milliseconds for --uart-transact")
+    parser.add_argument("--rtt-read", action="store_true", help="Find or use SEGGER RTT and read one bounded up-buffer window")
+    parser.add_argument("--rtt-address", metavar="ADDRESS", help="Known RTT control-block address for --rtt-read")
+    parser.add_argument("--rtt-channel", type=int, default=0, help="RTT up-buffer channel for --rtt-read")
+    parser.add_argument("--rtt-max-bytes", type=int, default=512, help="Maximum RTT bytes to read")
+    parser.add_argument("--rtt-consume", action="store_true", help="Advance RTT read offset after reading")
     args = parser.parse_args()
     if args.list_serial_ports:
         print(json.dumps(list_windows_serial_ports(), ensure_ascii=False, indent=2))
@@ -2703,6 +3009,20 @@ def main() -> int:
             if args.uart_send_hex is not None:
                 uart_args["send_hex"] = args.uart_send_hex
             print(json.dumps(server.call_tool("uart_transact", uart_args), ensure_ascii=False, indent=2))
+            return 0
+        except (BridgeError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.rtt_read:
+        try:
+            rtt_args = {
+                "channel": args.rtt_channel,
+                "max_bytes": args.rtt_max_bytes,
+                "consume": args.rtt_consume,
+            }
+            if args.rtt_address:
+                rtt_args["address"] = args.rtt_address
+            print(json.dumps(server.call_tool("rtt_read", rtt_args), ensure_ascii=False, indent=2))
             return 0
         except (BridgeError, ValueError) as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
