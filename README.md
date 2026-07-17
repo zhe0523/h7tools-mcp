@@ -165,9 +165,11 @@ memory base addresses, and configured FLM algorithm entries. To point it at a
 different local H7-TOOL device script, either pass `relative_path` to
 `target_identity` or set `adapter.target_lua_path` in `config.json`.
 
-The device-library tools (`device_vendors`, `device_search`, and
-`device_profile`) index only local files under
+The device-library tools (`device_vendors`, `device_search`, `device_profile`,
+and `device_capabilities`) index only local files under
 `EMMC/H7-TOOL/Programmer/Device`; they do not contact hardware. Search skips
 shared `Lib` scripts by default and treats `x` in device-script names as a
 loose wildcard, so a query such as `STM32H743` can find the generic
-`STM32H7x_2M.lua` profile.
+`STM32H7x_2M.lua` profile. `device_capabilities` also follows the profile's
+`IncludeList` and reports inferred read-only capabilities separately from
+dangerous write, erase, power, reset, or protection-changing code paths.

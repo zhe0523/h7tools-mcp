@@ -222,6 +222,13 @@ def _format_hex(value: int | None, width: int = 0) -> str | None:
     return f"0x{value:0{width}X}" if width else f"0x{value:X}"
 
 
+def _h7tool_device_path(path_text: str) -> Path | None:
+    prefix = "0:/H7-TOOL/Programmer/Device/"
+    if not path_text.startswith(prefix):
+        return None
+    return DEVICE_ROOT / path_text[len(prefix) :]
+
+
 def read_target_profile(config: dict[str, Any]) -> dict[str, Any]:
     adapter_config = config.get("adapter", {})
     configured_path = adapter_config.get("target_lua_path") if isinstance(adapter_config, dict) else None
@@ -360,6 +367,144 @@ def read_device_profile(arguments: dict[str, Any]) -> dict[str, Any]:
     except OSError as exc:
         raise BridgeError(f"Cannot read device Lua profile {script_path}: {exc}") from exc
     return parse_lua_target_profile(script_path, text)
+
+
+def _read_lua_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise BridgeError(f"Cannot read Lua file {path}: {exc}") from exc
+
+
+def _function_names(text: str) -> list[str]:
+    names = re.findall(r"(?m)^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", text)
+    return sorted(set(names))
+
+
+def _assigned_names(text: str) -> set[str]:
+    return set(re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", text))
+
+
+def _contains_any(text: str, patterns: tuple[str, ...]) -> list[str]:
+    found: list[str] = []
+    for pattern in patterns:
+        if re.search(pattern, text, flags=re.I):
+            found.append(pattern)
+    return found
+
+
+def device_capabilities(arguments: dict[str, Any]) -> dict[str, Any]:
+    script_path = resolve_device_script(arguments)
+    main_text = _read_lua_text(script_path)
+    profile = parse_lua_target_profile(script_path, main_text)
+    sources: list[dict[str, Any]] = [
+        {
+            "kind": "device",
+            "path": str(script_path),
+            "relative_path": _relative_device_path(script_path),
+        }
+    ]
+    combined_parts = [main_text]
+    for include in profile.get("include_list", []):
+        if not isinstance(include, str):
+            continue
+        include_path = _h7tool_device_path(include)
+        if include_path is None:
+            sources.append({"kind": "include", "path": include, "available": False})
+            continue
+        available = include_path.exists()
+        sources.append(
+            {
+                "kind": "include",
+                "path": str(include_path),
+                "relative_path": _relative_device_path(include_path),
+                "available": available,
+            }
+        )
+        if available:
+            combined_parts.append(_read_lua_text(include_path))
+    combined = "\n".join(combined_parts)
+    functions = _function_names(combined)
+    assignments = _assigned_names(combined)
+
+    read_only: list[dict[str, Any]] = []
+    dangerous: list[dict[str, Any]] = []
+    notes: list[str] = []
+
+    if profile.get("uid_address") and profile.get("uid_length"):
+        read_only.append(
+            {
+                "name": "uid",
+                "source": "UID_ADDR/UID_BYTES",
+                "address": profile.get("uid_address"),
+                "length": profile.get("uid_length"),
+            }
+        )
+    if profile.get("expected_idcode") or "ReadDeviceID" in functions:
+        read_only.append(
+            {
+                "name": "device_id",
+                "source": "MCU_ID/ReadDeviceID",
+                "expected_idcode": profile.get("expected_idcode"),
+            }
+        )
+    if profile.get("flash_address"):
+        read_only.append(
+            {
+                "name": "bounded_memory_read",
+                "source": "FLASH_ADDRESS/RAM_ADDRESS metadata + pg_read_mem",
+                "flash_address": profile.get("flash_address"),
+                "ram_address": profile.get("ram_address"),
+            }
+        )
+    if "OB_ADDRESS" in assignments or "OB_FILE_ADDRESS" in assignments:
+        read_only.append(
+            {
+                "name": "option_bytes_read",
+                "source": "OB_ADDRESS/OB_FILE_ADDRESS",
+                "supported": True,
+            }
+        )
+    if "OB_WRP_ADDRESS" in assignments or "MCU_CheckProtect" in functions:
+        read_only.append(
+            {
+                "name": "protection_status_read",
+                "source": "OB_WRP_ADDRESS/MCU_CheckProtect",
+                "supported": True,
+            }
+        )
+    if "MCU_ReadUID" in functions:
+        read_only.append({"name": "custom_uid_read", "source": "MCU_ReadUID"})
+    if "MCU_ReadOB" in functions:
+        read_only.append({"name": "custom_option_bytes_read", "source": "MCU_ReadOB"})
+    if "MCU_ReadOptionByte" in functions:
+        read_only.append({"name": "custom_option_byte_read", "source": "MCU_ReadOptionByte"})
+
+    dangerous_patterns = {
+        "target_register_write": (r"\bpg_write(?:8|16|32)?\b",),
+        "flash_or_ob_program": (r"\bpg_prog_", r"\bMCU_ProgOptionBytes\b"),
+        "erase": (r"\bpg_erase_", r"\berase_chip\b"),
+        "read_protect_change": (r"\bset_read_protect\b", r"\bMCU_RemoveProtect\b", r"\bRemoveProtect\b"),
+        "power_or_reset_side_effect": (r"\bset_tvcc\b", r"\bpoweroff\b", r"\breset\b"),
+    }
+    for name, patterns in dangerous_patterns.items():
+        matched = _contains_any(combined, patterns)
+        if matched:
+            dangerous.append({"name": name, "matched_patterns": matched})
+
+    if dangerous:
+        notes.append("Dangerous capabilities are reported for awareness only; MCP does not expose them as callable actions.")
+    if any(item["name"] == "option_bytes_read" for item in read_only):
+        notes.append("Option-byte read support is inferred from Lua metadata; a separate hardware read tool should still be validated per family.")
+
+    return {
+        "profile": profile,
+        "sources": sources,
+        "functions": functions,
+        "read_only_capabilities": read_only,
+        "dangerous_capabilities": dangerous,
+        "notes": notes,
+    }
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -1296,6 +1441,8 @@ class H7ToolMcp:
             )
         if name == "device_profile":
             return read_device_profile(arguments)
+        if name == "device_capabilities":
+            return device_capabilities(arguments)
         if name == "tool_status":
             if self.adapter.kind in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
                 return self.read_modbus_status()
@@ -1375,6 +1522,20 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "device_profile",
         "description": "Parse one local H7-TOOL device Lua profile and return metadata such as interface, IDCODE, UID address, memory base addresses, includes, and FLM algorithms.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "vendor": {"type": "string"},
+                "series": {"type": "string"},
+                "device": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "device_capabilities",
+        "description": "Inspect one local H7-TOOL device Lua profile plus included device libraries and summarize inferred read-only and dangerous capabilities. Pure filesystem analysis; no hardware access.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1591,6 +1752,10 @@ def self_test(_server: H7ToolMcp) -> int:
     assert any(item["relative_path"] == "ST/STM32H7xx/STM32H7x_2M.lua" for item in fuzzy_search["matches"])
     device_profile = read_device_profile({"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"})
     assert device_profile["expected_idcode"] == "0x6BA02477"
+    caps = device_capabilities({"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"})
+    assert any(item["name"] == "uid" for item in caps["read_only_capabilities"])
+    assert any(item["name"] == "option_bytes_read" for item in caps["read_only_capabilities"])
+    assert any(item["name"] == "flash_or_ob_program" for item in caps["dangerous_capabilities"])
     selected_profile = read_selected_target_profile(
         {"adapter": {}},
         {"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"},
@@ -1622,6 +1787,7 @@ def main() -> int:
     parser.add_argument("--device-vendor", metavar="VENDOR", help="Restrict --device-search to one vendor")
     parser.add_argument("--include-libraries", action="store_true", help="Include shared Lib scripts in --device-search results")
     parser.add_argument("--device-profile", metavar="RELATIVE_PATH", help="Parse one local H7-TOOL device Lua profile")
+    parser.add_argument("--device-capabilities", metavar="RELATIVE_PATH", help="Inspect one local H7-TOOL device Lua profile for read-only and dangerous capabilities")
     parser.add_argument("--self-test", action="store_true", help="Test MCP logic using only the built-in mock adapter")
     parser.add_argument("--probe-h7tool", action="store_true", help="Run the configured read-only tool_status probe and print JSON")
     parser.add_argument("--health-summary", action="store_true", help="Run the configured conservative read-only health assessment and print JSON")
@@ -1651,6 +1817,9 @@ def main() -> int:
         return 0
     if args.device_profile is not None:
         print(json.dumps(read_device_profile({"relative_path": args.device_profile}), ensure_ascii=False, indent=2))
+        return 0
+    if args.device_capabilities is not None:
+        print(json.dumps(device_capabilities({"relative_path": args.device_capabilities}), ensure_ascii=False, indent=2))
         return 0
     config = load_config(args.config)
     server = H7ToolMcp(config, args.config)
