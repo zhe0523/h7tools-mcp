@@ -4,6 +4,8 @@
 
 Cherry Studio 官方 MCP 配置流程是：打开设置，进入 `MCP 服务器`，点击 `添加服务器`，选择 `STDIO` 类型，然后填写命令和参数。
 
+其他 AI 客户端配置见：[AI 客户端接入 H7-TOOL MCP 指南](ai-clients.zh-CN.md)。
+
 ## 1. 准备项目目录
 
 推荐把本仓库放在 H7-TOOL PC 软件包根目录下，并命名为 `mcp`：
