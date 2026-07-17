@@ -165,6 +165,55 @@ def parse_option_bytes_output(raw: bytes) -> dict[str, Any]:
     return {"raw": text, "format": "h7tool_option_bytes", "data": data}
 
 
+def parse_uart_transact_output(raw: bytes) -> dict[str, Any]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    data: dict[str, Any] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key in {"configured", "channel", "baudrate", "parity", "data_bits", "stop_bits", "tx_len", "rx_len"}:
+            data[key] = _parse_lua_number(value)
+        elif key == "rx_hex":
+            parts = [part.upper() for part in value.split() if part]
+            data["rx_hex"] = " ".join(parts)
+            data["rx_bytes"] = parts
+        elif key == "rx_text":
+            data["rx_text"] = value
+        else:
+            data[key] = value
+    data["ok"] = data.get("configured") == 1 and isinstance(data.get("rx_len"), int)
+    return {"raw": text, "format": "h7tool_uart_transact", "data": data}
+
+
+def parse_hex_bytes(value: str) -> bytes:
+    cleaned = re.sub(r"[^0-9A-Fa-f]", "", value)
+    if not cleaned:
+        return b""
+    if len(cleaned) % 2:
+        raise BridgeError("send_hex must contain an even number of hex digits")
+    try:
+        return bytes.fromhex(cleaned)
+    except ValueError as exc:
+        raise BridgeError("send_hex must contain only hexadecimal bytes, for example '48 37 0D 0A'") from exc
+
+
+def lua_string_literal(data: bytes) -> str:
+    parts: list[str] = []
+    for byte in data:
+        if 32 <= byte <= 126 and byte not in (34, 92):
+            parts.append(chr(byte))
+        elif byte == 34:
+            parts.append('\\"')
+        elif byte == 92:
+            parts.append("\\\\")
+        else:
+            parts.append(f"\\{byte:03d}")
+    return '"' + "".join(parts) + '"'
+
+
 def _parse_lua_number(value: str) -> int | str:
     try:
         return int(float(value))
@@ -1532,6 +1581,56 @@ print("H7TOOL_OB_END")
         result["result"] = parse_option_bytes_output(result["result"]["raw"].encode("utf-8", errors="replace"))
         return result
 
+    def run_uart_transact_script(
+        self,
+        channel: int,
+        baudrate: int,
+        parity: int,
+        data_bits: int,
+        stop_bits: int,
+        tx_data: bytes,
+        rx_length: int,
+        timeout_ms: int,
+    ) -> dict[str, Any]:
+        tx_literal = lua_string_literal(tx_data)
+        script = f"""print("H7TOOL_UART_BEGIN")
+local COM={channel}
+local BAUD={baudrate}
+local PARITY={parity}
+local DATABITS={data_bits}
+local STOPBITS={stop_bits}
+local TX={tx_literal}
+local RX_LEN={rx_length}
+local TIMEOUT={timeout_ms}
+local function hx(b)
+ local r=""
+ for i=1,string.len(b),1 do
+  r=r..string.format("%02X",string.byte(b,i))
+  if i<string.len(b) then r=r.." " end
+ end
+ return r
+end
+uart_cfg(COM,BAUD,PARITY,DATABITS,STOPBITS)
+print("configured=1")
+print("channel="..COM)
+print("baudrate="..BAUD)
+print("parity="..PARITY)
+print("data_bits="..DATABITS)
+print("stop_bits="..STOPBITS)
+if string.len(TX)>0 then uart_send(COM,TX) end
+print("tx_len="..string.len(TX))
+local rx_len,rx_data=uart_recive(COM,RX_LEN,TIMEOUT)
+if rx_len==nil then rx_len=0 end
+if rx_data==nil then rx_data="" end
+print("rx_len="..rx_len)
+print("rx_hex="..hx(rx_data))
+print("rx_text="..rx_data)
+print("H7TOOL_UART_END")
+""".encode("ascii")
+        result = self._run_lua_script(script, "generated/uart_transact.lua", b"H7TOOL_UART_BEGIN", b"H7TOOL_UART_END")
+        result["result"] = parse_uart_transact_output(result["result"]["raw"].encode("utf-8", errors="replace"))
+        return result
+
 
 class H7ToolMcp:
     def __init__(self, config: dict[str, Any], config_path: Path) -> None:
@@ -1622,6 +1721,53 @@ class H7ToolMcp:
 
     def read_hid_target_memory(self, address: int, length: int) -> dict[str, Any]:
         return self.hid_modbus.run_read_memory_script(address, length)
+
+    def uart_transact(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        channel = int(arguments.get("channel", 1))
+        baudrate = int(arguments.get("baudrate", 115200))
+        parity = int(arguments.get("parity", 0))
+        data_bits = int(arguments.get("data_bits", 8))
+        stop_bits = int(arguments.get("stop_bits", 1))
+        rx_length = int(arguments.get("rx_length", 256))
+        timeout_ms = int(arguments.get("timeout_ms", 500))
+        if not 1 <= channel <= 8:
+            raise BridgeError("channel must be between 1 and 8")
+        if not 1200 <= baudrate <= 3000000:
+            raise BridgeError("baudrate must be between 1200 and 3000000")
+        if parity not in {0, 1, 2}:
+            raise BridgeError("parity must be 0, 1, or 2")
+        if data_bits not in {7, 8}:
+            raise BridgeError("data_bits must be 7 or 8")
+        if stop_bits not in {1, 2}:
+            raise BridgeError("stop_bits must be 1 or 2")
+        if not 0 <= rx_length <= 1024:
+            raise BridgeError("rx_length must be between 0 and 1024 bytes")
+        if not 1 <= timeout_ms <= 10000:
+            raise BridgeError("timeout_ms must be between 1 and 10000 ms")
+        send_text = arguments.get("send_text")
+        send_hex = arguments.get("send_hex")
+        if isinstance(send_text, str) and isinstance(send_hex, str) and send_text and send_hex:
+            raise BridgeError("Provide only one of send_text or send_hex")
+        if isinstance(send_hex, str) and send_hex:
+            tx_data = parse_hex_bytes(send_hex)
+        elif isinstance(send_text, str) and send_text:
+            tx_data = send_text.encode("utf-8")
+        else:
+            tx_data = b""
+        if len(tx_data) > 512:
+            raise BridgeError("UART send payload is limited to 512 bytes")
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError("uart_transact currently requires adapter.type = h7tool_hid")
+        return self.hid_modbus.run_uart_transact_script(
+            channel=channel,
+            baudrate=baudrate,
+            parity=parity,
+            data_bits=data_bits,
+            stop_bits=stop_bits,
+            tx_data=tx_data,
+            rx_length=rx_length,
+            timeout_ms=timeout_ms,
+        )
 
     def read_option_bytes(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.adapter.kind != "h7tool_hid":
@@ -1848,6 +1994,8 @@ class H7ToolMcp:
             return self.target_summary(arguments)
         if name == "target_flash_info":
             return self.target_flash_info(arguments)
+        if name == "uart_transact":
+            return self.uart_transact(arguments)
         if name == "read_option_bytes":
             return self.read_option_bytes(arguments)
         if name == "protection_status":
@@ -2037,6 +2185,25 @@ TOOLS: list[dict[str, Any]] = [
                 "vendor": {"type": "string"},
                 "series": {"type": "string"},
                 "device": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "uart_transact",
+        "description": "Configure one H7-TOOL UART channel, optionally send a short payload, and read a bounded response window.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "integer", "minimum": 1, "maximum": 8, "default": 1},
+                "baudrate": {"type": "integer", "minimum": 1200, "maximum": 3000000, "default": 115200},
+                "parity": {"type": "integer", "enum": [0, 1, 2], "default": 0},
+                "data_bits": {"type": "integer", "enum": [7, 8], "default": 8},
+                "stop_bits": {"type": "integer", "enum": [1, 2], "default": 1},
+                "send_text": {"type": "string", "description": "UTF-8 text payload to send. Do not combine with send_hex."},
+                "send_hex": {"type": "string", "description": "Hex byte payload such as '48 37 0D 0A'. Do not combine with send_text."},
+                "rx_length": {"type": "integer", "minimum": 0, "maximum": 1024, "default": 256},
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 500},
             },
             "additionalProperties": False,
         },
@@ -2248,6 +2415,19 @@ def self_test(_server: H7ToolMcp) -> int:
     )
     assert ob["data"]["ok"] is True
     assert ob["data"]["data_hex"] == "F0 AA"
+    uart = parse_uart_transact_output(
+        b"H7TOOL_UART_BEGIN\nconfigured=1\nchannel=1\nbaudrate=115200\ntx_len=2\nrx_len=2\nrx_hex=4F 4B\nrx_text=OK\nH7TOOL_UART_END\n"
+    )
+    assert uart["data"]["ok"] is True
+    assert uart["data"]["rx_bytes"] == ["4F", "4B"]
+    assert parse_hex_bytes("48 37-0d0a") == b"H7\r\n"
+    assert lua_string_literal(b'H7"\r\n') == '"H7\\"\\013\\010"'
+    try:
+        server.call_tool("uart_transact", {"send_text": "a", "send_hex": "61"})
+    except BridgeError:
+        pass
+    else:
+        raise AssertionError("UART send_text/send_hex exclusivity was not enforced")
     profile = parse_lua_target_profile(
         Path("Device/ST/STM32H7xx/STM32H7x_2M.lua"),
         'CHIP_TYPE = "SWD"\nMCU_ID = 0x6BA02477\nUID_ADDR = 0x1FF1E800\nUID_BYTES = 12\n'
@@ -2373,6 +2553,16 @@ def main() -> int:
     parser.add_argument("--protection-status", nargs="?", const="", metavar="RELATIVE_PATH", help="Read and summarize protection status using a selected local device Lua profile")
     parser.add_argument("--read-memory", nargs=2, metavar=("ADDRESS", "LENGTH"), help="Read a bounded target memory range through the configured adapter")
     parser.add_argument("--tool-registers", nargs=2, metavar=("ADDRESS", "COUNT"), help="Read bounded H7-TOOL holding registers through the configured Modbus adapter")
+    parser.add_argument("--uart-transact", action="store_true", help="Configure H7-TOOL UART, optionally send data, and read a bounded response")
+    parser.add_argument("--uart-channel", type=int, default=1, help="UART channel for --uart-transact")
+    parser.add_argument("--uart-baud", type=int, default=115200, help="Baudrate for --uart-transact")
+    parser.add_argument("--uart-parity", type=int, default=0, choices=[0, 1, 2], help="Parity for --uart-transact: 0, 1, or 2")
+    parser.add_argument("--uart-data-bits", type=int, default=8, choices=[7, 8], help="Data bits for --uart-transact")
+    parser.add_argument("--uart-stop-bits", type=int, default=1, choices=[1, 2], help="Stop bits for --uart-transact")
+    parser.add_argument("--uart-send-text", help="UTF-8 text payload for --uart-transact")
+    parser.add_argument("--uart-send-hex", help="Hex byte payload for --uart-transact, for example '48 37 0D 0A'")
+    parser.add_argument("--uart-rx-length", type=int, default=256, help="Maximum UART bytes to receive for --uart-transact")
+    parser.add_argument("--uart-timeout-ms", type=int, default=500, help="UART receive timeout in milliseconds for --uart-transact")
     args = parser.parse_args()
     if args.list_serial_ports:
         print(json.dumps(list_windows_serial_ports(), ensure_ascii=False, indent=2))
@@ -2490,6 +2680,26 @@ def main() -> int:
         try:
             address, count = args.tool_registers
             print(json.dumps(server.call_tool("tool_registers", {"address": address, "count": int(count)}), ensure_ascii=False, indent=2))
+            return 0
+        except (BridgeError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.uart_transact:
+        try:
+            uart_args = {
+                "channel": args.uart_channel,
+                "baudrate": args.uart_baud,
+                "parity": args.uart_parity,
+                "data_bits": args.uart_data_bits,
+                "stop_bits": args.uart_stop_bits,
+                "rx_length": args.uart_rx_length,
+                "timeout_ms": args.uart_timeout_ms,
+            }
+            if args.uart_send_text is not None:
+                uart_args["send_text"] = args.uart_send_text
+            if args.uart_send_hex is not None:
+                uart_args["send_hex"] = args.uart_send_hex
+            print(json.dumps(server.call_tool("uart_transact", uart_args), ensure_ascii=False, indent=2))
             return 0
         except (BridgeError, ValueError) as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)

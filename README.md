@@ -165,6 +165,10 @@ Use h7tool target_summary with ST/STM32H7xx/STM32H7x_2M.lua and recommend the ne
 Use h7tool protection_status for the selected STM32H7 profile and explain the result.
 ```
 
+```text
+Use h7tool uart_transact on channel 1, 115200 8N1, send hex: 48 37 0D 0A, and read up to 64 response bytes.
+```
+
 Good workflow:
 
 1. Ask the AI to check `bridge_status`.
@@ -190,6 +194,7 @@ Good workflow:
 - `tool_registers`
 - `read_option_bytes`
 - `protection_status`
+- `uart_transact`
 - `log_tail`
 - `read_memory`
 
