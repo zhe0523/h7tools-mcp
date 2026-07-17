@@ -64,6 +64,40 @@ def parse_response(raw: bytes) -> dict[str, Any]:
     return {"raw": text, "format": "json", "data": parsed}
 
 
+def parse_target_probe_output(raw: bytes) -> dict[str, Any]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    data: dict[str, Any] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key in {"idcode", "cpuid", "uid_address"} and value.lower().startswith("0x"):
+            data[key] = value.upper().replace("X", "x")
+        elif key in {"uid_length", "uid_read"}:
+            try:
+                data[key] = int(float(value))
+            except ValueError:
+                data[key] = value
+        elif key == "uid":
+            parts = [part.upper() for part in value.split() if part]
+            data["uid_hex"] = " ".join(parts)
+            data["uid_bytes"] = parts
+        elif key in {"pg_init", "jtag2swd"}:
+            data[key] = value
+    connected = False
+    uid_read = data.get("uid_read")
+    if uid_read == 1:
+        connected = True
+    for key in ("idcode", "cpuid"):
+        value = data.get(key)
+        if isinstance(value, str) and value not in {"0x00000000", "unavailable"}:
+            connected = True
+    data["connected"] = connected
+    return {"raw": text, "format": "h7tool_target_probe", "data": data}
+
+
 def crc16_modbus(data: bytes) -> int:
     """CRC-16/MODBUS, as used by the legacy H7-TOOL USB/UDP RTU framing."""
     crc = 0xFFFF
@@ -729,18 +763,18 @@ class H7ToolHidModbusAdapter:
             "No matching H7-TOOL HID response. Verify the vendor PC application is closed and the tool is not in another active HID mode."
         )
 
-    def run_health_script(self) -> dict[str, Any]:
+    def _run_fixed_lua_script(self, script_name: str, begin_marker: bytes, end_marker: bytes) -> dict[str, Any]:
         try:
             import hid  # type: ignore[import-not-found]
         except ImportError as exc:
             raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
-        script_path = Path(__file__).with_name("diagnostics") / "tool_health.lua"
+        script_path = Path(__file__).with_name("diagnostics") / script_name
         try:
             script = script_path.read_bytes()
         except OSError as exc:
-            raise BridgeError(f"Cannot read bundled health script: {exc}") from exc
-        if b"H7TOOL_DIAG_BEGIN" not in script or b"H7TOOL_DIAG_END" not in script:
-            raise BridgeError("Bundled health script failed its safety marker check")
+            raise BridgeError(f"Cannot read bundled Lua script {script_name}: {exc}") from exc
+        if begin_marker not in script or end_marker not in script:
+            raise BridgeError(f"Bundled Lua script {script_name} failed its safety marker check")
         item = self._find_interface()
         timeout_ms = max(1000, int(self.config.get("timeout_ms", 8000)))
         payload = script + (b"" if script.endswith(b"\0") else b"\0")
@@ -779,7 +813,7 @@ class H7ToolHidModbusAdapter:
                     text = text.lstrip(b"\0")
                     output.extend(text)
                     decoded = output.decode("utf-8", errors="replace")
-                    if "H7TOOL_DIAG_END" in decoded:
+                    if end_marker.decode("ascii") in decoded:
                         break
         except BridgeError:
             raise
@@ -793,14 +827,28 @@ class H7ToolHidModbusAdapter:
         decoded = output.decode("utf-8", errors="replace").strip()
         if not ack_seen:
             raise BridgeError("No H7-TOOL HID Lua acknowledgement; close the vendor PC application and retry")
-        if "H7TOOL_DIAG_BEGIN" not in decoded or "H7TOOL_DIAG_END" not in decoded:
+        begin_text = begin_marker.decode("ascii")
+        end_text = end_marker.decode("ascii")
+        if begin_text not in decoded or end_text not in decoded:
             raise BridgeError(f"Lua was acknowledged but diagnostic output was incomplete: {decoded!r}")
         return {
             "transport": "h7tool_hid/function_64_lua + function_61_print_poll",
-            "script": "diagnostics/tool_health.lua",
+            "script": f"diagnostics/{script_name}",
             "reports": reports,
             "result": parse_response(output),
         }
+
+    def run_health_script(self) -> dict[str, Any]:
+        return self._run_fixed_lua_script("tool_health.lua", b"H7TOOL_DIAG_BEGIN", b"H7TOOL_DIAG_END")
+
+    def run_target_probe_script(self) -> dict[str, Any]:
+        result = self._run_fixed_lua_script(
+            "target_probe_stm32h7.lua",
+            b"H7TOOL_TARGET_BEGIN",
+            b"H7TOOL_TARGET_END",
+        )
+        result["result"] = parse_target_probe_output(result["result"]["raw"].encode("utf-8", errors="replace"))
+        return result
 
 
 class H7ToolMcp:
@@ -887,6 +935,9 @@ class H7ToolMcp:
     def read_hid_lua_health(self) -> dict[str, Any]:
         return self.hid_modbus.run_health_script()
 
+    def read_hid_target_probe(self) -> dict[str, Any]:
+        return self.hid_modbus.run_target_probe_script()
+
     def health_summary(self) -> dict[str, Any]:
         if self.adapter.kind not in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
             raise BridgeError("health_summary requires adapter.type = modbus_tcp, modbus_udp, or h7tool_hid")
@@ -913,6 +964,8 @@ class H7ToolMcp:
                 raise BridgeError("tool_registers requires adapter.type = modbus_tcp, modbus_udp, or h7tool_hid")
             return self.read_modbus_registers(arguments)
         if name == "target_probe":
+            if self.adapter.kind == "h7tool_hid":
+                return self.read_hid_target_probe()
             return self.run_configured_command("target_probe", arguments)
         if name == "log_tail":
             source = str(arguments.get("source", ""))
@@ -958,7 +1011,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "target_probe",
-        "description": "Run the configured read-only target probe command, for example SWD ID/UID detection.",
+        "description": "Run a read-only target probe. With adapter.type=h7tool_hid, executes only the bundled STM32H7 UID probe script over HID.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -1105,6 +1158,11 @@ def self_test(_server: H7ToolMcp) -> int:
     ack_report = ack_body + crc16_modbus(ack_body).to_bytes(2, "little")
     assert H7ToolHidModbusAdapter._extract_lua_ack(ack_report + b"\xff" * 16)
     assert H7ToolHidModbusAdapter._lua_poll_frame(0).hex() == "016100000000100000000000000029ed"
+    target = parse_target_probe_output(
+        b"H7TOOL_TARGET_BEGIN\nidcode=0x6BA02477\nuid_read=1.0\nuid=3C 00 1E 00\nH7TOOL_TARGET_END\n"
+    )
+    assert target["data"]["connected"] is True
+    assert target["data"]["uid_bytes"] == ["3C", "00", "1E", "00"]
     try:
         server.call_tool("read_memory", {"address": "0x20000000", "length": 4096})
     except BridgeError:
@@ -1130,6 +1188,7 @@ def main() -> int:
     parser.add_argument("--probe-h7tool", action="store_true", help="Run the configured read-only tool_status probe and print JSON")
     parser.add_argument("--health-summary", action="store_true", help="Run the configured conservative read-only health assessment and print JSON")
     parser.add_argument("--lua-health", action="store_true", help="Run the bundled read-only Lua health script through the configured HID adapter")
+    parser.add_argument("--target-probe", action="store_true", help="Run the configured read-only target probe and print JSON")
     parser.add_argument("--tool-registers", nargs=2, metavar=("ADDRESS", "COUNT"), help="Read bounded H7-TOOL holding registers through the configured Modbus adapter")
     args = parser.parse_args()
     if args.list_serial_ports:
@@ -1159,6 +1218,13 @@ def main() -> int:
     if args.lua_health:
         try:
             print(json.dumps(server.call_tool("lua_health", {}), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.target_probe:
+        try:
+            print(json.dumps(server.call_tool("target_probe", {}), ensure_ascii=False, indent=2))
             return 0
         except BridgeError as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)

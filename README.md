@@ -111,9 +111,10 @@ control. The allowed adapter types:
 - `h7tool_hid`: verified current USB transport. It selects only the
   vendor-defined `H7-TOOL HID Communication` interface and provides only
   function-`0x03` read access plus the fixed bundled `tool_health.lua`
-  diagnostic runner. It is verified with V2.33 using 1024-byte reports and
-  standard low-byte-first Modbus CRC. Close the vendor PC application before
-  use if it otherwise owns the same HID reports.
+  diagnostic runner and fixed bundled STM32H7 target UID probe. It is verified
+  with V2.33 using 1024-byte reports and standard low-byte-first Modbus CRC.
+  Close the vendor PC application before use if it otherwise owns the same HID
+  reports.
 
 The `commands` values are Python format templates. Only the following
 read-oriented names are accepted by the bridge: `status`, `target_probe`,
@@ -147,3 +148,8 @@ The verified V2.33 HID Lua flow mirrors the vendor PC "Download" action: send
 one padded 1024-byte HID payload containing function `0x64`, then poll channels
 0..4 with function `0x61` until the fixed script's `H7TOOL_DIAG_END` marker is
 seen. The MCP bridge does not accept caller-provided Lua.
+
+`target_probe` over `h7tool_hid` uses the same fixed-script path with
+`diagnostics/target_probe_stm32h7.lua`. It is read-only and mirrors the manual
+Programmer test for an STM32H7x target: initialize the SWD programmer link,
+read IDCODE when available, and read 12 UID bytes from `0x1FF1E800`.
