@@ -121,7 +121,10 @@ read-oriented names are accepted by the bridge: `status`, `target_probe`,
 `target_identity`, `read_memory`, `uart_tail`, `rtt_tail`, and `can_tail`.
 
 `read_memory` is capped at 1024 bytes and logs are capped at 200 lines by
-default. Changing those limits does not permit any write action.
+default. With `h7tool_hid`, `read_memory` uses a generated read-only Lua
+template containing only validated numeric address/length values and calls
+`pg_read_mem`; MCP callers cannot provide arbitrary Lua. Changing those limits
+does not permit any write action.
 
 ## Health summary
 

@@ -101,6 +101,37 @@ def parse_target_probe_output(raw: bytes) -> dict[str, Any]:
     return {"raw": text, "format": "h7tool_target_probe", "data": data}
 
 
+def parse_read_memory_output(raw: bytes) -> dict[str, Any]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    data: dict[str, Any] = {}
+    chunks: list[tuple[int, list[str]]] = []
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key == "address" and value.lower().startswith("0x"):
+            data["address"] = value.upper().replace("X", "x")
+        elif key in {"length", "read"}:
+            try:
+                data[key] = int(float(value))
+            except ValueError:
+                data[key] = value
+        else:
+            match = re.fullmatch(r"data\[(\d+)\]", key)
+            if match:
+                chunks.append((int(match.group(1)), [part.upper() for part in value.split() if part]))
+    memory_bytes: list[str] = []
+    for _offset, parts in sorted(chunks, key=lambda item: item[0]):
+        memory_bytes.extend(parts)
+    if memory_bytes:
+        data["data_hex"] = " ".join(memory_bytes)
+        data["data_bytes"] = memory_bytes
+    data["ok"] = data.get("read") == 1 and len(memory_bytes) == data.get("length")
+    return {"raw": text, "format": "h7tool_read_memory", "data": data}
+
+
 def _safe_int_expr(expr: str) -> int | None:
     """Evaluate the small integer expressions used in H7-TOOL Lua metadata."""
     try:
@@ -858,18 +889,13 @@ class H7ToolHidModbusAdapter:
             "No matching H7-TOOL HID response. Verify the vendor PC application is closed and the tool is not in another active HID mode."
         )
 
-    def _run_fixed_lua_script(self, script_name: str, begin_marker: bytes, end_marker: bytes) -> dict[str, Any]:
+    def _run_lua_script(self, script: bytes, script_label: str, begin_marker: bytes, end_marker: bytes) -> dict[str, Any]:
         try:
             import hid  # type: ignore[import-not-found]
         except ImportError as exc:
             raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
-        script_path = Path(__file__).with_name("diagnostics") / script_name
-        try:
-            script = script_path.read_bytes()
-        except OSError as exc:
-            raise BridgeError(f"Cannot read bundled Lua script {script_name}: {exc}") from exc
         if begin_marker not in script or end_marker not in script:
-            raise BridgeError(f"Bundled Lua script {script_name} failed its safety marker check")
+            raise BridgeError(f"Lua script {script_label} failed its safety marker check")
         item = self._find_interface()
         timeout_ms = max(1000, int(self.config.get("timeout_ms", 8000)))
         payload = script + (b"" if script.endswith(b"\0") else b"\0")
@@ -928,10 +954,18 @@ class H7ToolHidModbusAdapter:
             raise BridgeError(f"Lua was acknowledged but diagnostic output was incomplete: {decoded!r}")
         return {
             "transport": "h7tool_hid/function_64_lua + function_61_print_poll",
-            "script": f"diagnostics/{script_name}",
+            "script": script_label,
             "reports": reports,
             "result": parse_response(output),
         }
+
+    def _run_fixed_lua_script(self, script_name: str, begin_marker: bytes, end_marker: bytes) -> dict[str, Any]:
+        script_path = Path(__file__).with_name("diagnostics") / script_name
+        try:
+            script = script_path.read_bytes()
+        except OSError as exc:
+            raise BridgeError(f"Cannot read bundled Lua script {script_name}: {exc}") from exc
+        return self._run_lua_script(script, f"diagnostics/{script_name}", begin_marker, end_marker)
 
     def run_health_script(self) -> dict[str, Any]:
         return self._run_fixed_lua_script("tool_health.lua", b"H7TOOL_DIAG_BEGIN", b"H7TOOL_DIAG_END")
@@ -943,6 +977,39 @@ class H7ToolHidModbusAdapter:
             b"H7TOOL_TARGET_END",
         )
         result["result"] = parse_target_probe_output(result["result"]["raw"].encode("utf-8", errors="replace"))
+        return result
+
+    def run_read_memory_script(self, address: int, length: int) -> dict[str, Any]:
+        script = f"""print("H7TOOL_MEM_BEGIN")
+local A=0x{address:08X}
+local L={length}
+local function hx(b,s,n)
+ local r=""
+ for i=s,s+n-1 do r=r..string.format("%02X ",string.byte(b,i)) end
+ return r
+end
+if pg_init then local r=pg_init() if r==nil then print("pg_init=nil") else print("pg_init="..r) end end
+print(string.format("address=0x%08X",A))
+print("length="..L)
+if pg_read_mem then
+ local ok,b=pg_read_mem(A,L)
+ print("read="..ok)
+ if ok==1 and b then
+  local o=1
+  while o<=#b do
+   local n=16
+   if o+n-1>#b then n=#b-o+1 end
+   print(string.format("data[%d]=",o-1)..hx(b,o,n))
+   o=o+n
+  end
+ end
+else
+ print("read=unavailable")
+end
+print("H7TOOL_MEM_END")
+""".encode("ascii")
+        result = self._run_lua_script(script, "generated/read_memory.lua", b"H7TOOL_MEM_BEGIN", b"H7TOOL_MEM_END")
+        result["result"] = parse_read_memory_output(result["result"]["raw"].encode("utf-8", errors="replace"))
         return result
 
 
@@ -1033,6 +1100,9 @@ class H7ToolMcp:
     def read_hid_target_probe(self) -> dict[str, Any]:
         return self.hid_modbus.run_target_probe_script()
 
+    def read_hid_target_memory(self, address: int, length: int) -> dict[str, Any]:
+        return self.hid_modbus.run_read_memory_script(address, length)
+
     def target_identity(self) -> dict[str, Any]:
         if self.adapter.kind != "h7tool_hid":
             raise BridgeError("target_identity currently requires adapter.type = h7tool_hid")
@@ -1114,8 +1184,16 @@ class H7ToolMcp:
             max_length = int(self.config["limits"]["max_read_memory_bytes"])
             if not address.startswith("0x"):
                 raise BridgeError("address must be hexadecimal, for example 0x20000000")
+            try:
+                address_int = int(address, 16)
+            except ValueError as exc:
+                raise BridgeError("address must be hexadecimal, for example 0x20000000") from exc
+            if not 0 <= address_int <= 0xFFFFFFFF:
+                raise BridgeError("address must be a 32-bit target address")
             if not 1 <= length <= max_length:
                 raise BridgeError(f"length must be between 1 and {max_length} bytes")
+            if self.adapter.kind == "h7tool_hid":
+                return self.read_hid_target_memory(address_int, length)
             return self.run_configured_command("read_memory", {"address": address, "length": length})
         raise BridgeError(f"Unknown tool: {name}")
 
@@ -1179,7 +1257,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "read_memory",
-        "description": "Read a bounded memory range through a configured read-only command. It cannot write target memory.",
+        "description": "Read a bounded target memory range. With adapter.type=h7tool_hid, uses a generated read-only Lua pg_read_mem template; other adapters require a configured read-only command.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1300,6 +1378,11 @@ def self_test(_server: H7ToolMcp) -> int:
     )
     assert target["data"]["connected"] is True
     assert target["data"]["uid_bytes"] == ["3C", "00", "1E", "00"]
+    memory = parse_read_memory_output(
+        b"H7TOOL_MEM_BEGIN\naddress=0x20000000\nlength=4\nread=1.0\ndata[0]=12 34 AB CD \nH7TOOL_MEM_END\n"
+    )
+    assert memory["data"]["ok"] is True
+    assert memory["data"]["data_bytes"] == ["12", "34", "AB", "CD"]
     profile = parse_lua_target_profile(
         Path("Device/ST/STM32H7xx/STM32H7x_2M.lua"),
         'CHIP_TYPE = "SWD"\nMCU_ID = 0x6BA02477\nUID_ADDR = 0x1FF1E800\nUID_BYTES = 12\n'
@@ -1335,6 +1418,7 @@ def main() -> int:
     parser.add_argument("--lua-health", action="store_true", help="Run the bundled read-only Lua health script through the configured HID adapter")
     parser.add_argument("--target-probe", action="store_true", help="Run the configured read-only target probe and print JSON")
     parser.add_argument("--target-identity", action="store_true", help="Run the read-only target identity profile and print JSON")
+    parser.add_argument("--read-memory", nargs=2, metavar=("ADDRESS", "LENGTH"), help="Read a bounded target memory range through the configured adapter")
     parser.add_argument("--tool-registers", nargs=2, metavar=("ADDRESS", "COUNT"), help="Read bounded H7-TOOL holding registers through the configured Modbus adapter")
     args = parser.parse_args()
     if args.list_serial_ports:
@@ -1380,6 +1464,14 @@ def main() -> int:
             print(json.dumps(server.call_tool("target_identity", {}), ensure_ascii=False, indent=2))
             return 0
         except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.read_memory:
+        try:
+            address, length = args.read_memory
+            print(json.dumps(server.call_tool("read_memory", {"address": address, "length": int(length)}), ensure_ascii=False, indent=2))
+            return 0
+        except (BridgeError, ValueError) as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
             return 2
     if args.tool_registers:
