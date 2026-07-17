@@ -162,8 +162,8 @@ Lua metadata. By default it reads the bundled
 `EMMC/H7-TOOL/Programmer/Device/ST/STM32H7xx/STM32H7x_2M.lua` profile and
 returns the selected vendor, series, device, expected IDCODE, UID location,
 memory base addresses, and configured FLM algorithm entries. To point it at a
-different local H7-TOOL device script, set `adapter.target_lua_path` in
-`config.json`.
+different local H7-TOOL device script, either pass `relative_path` to
+`target_identity` or set `adapter.target_lua_path` in `config.json`.
 
 The device-library tools (`device_vendors`, `device_search`, and
 `device_profile`) index only local files under

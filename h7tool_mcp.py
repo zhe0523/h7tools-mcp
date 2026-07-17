@@ -233,6 +233,12 @@ def read_target_profile(config: dict[str, Any]) -> dict[str, Any]:
     return parse_lua_target_profile(script_path, text)
 
 
+def read_selected_target_profile(config: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
+    if any(key in arguments for key in ("relative_path", "vendor", "series", "device")):
+        return read_device_profile(arguments)
+    return read_target_profile(config)
+
+
 def _device_lua_files() -> list[Path]:
     if not DEVICE_ROOT.exists():
         raise BridgeError(f"H7-TOOL device library not found: {DEVICE_ROOT}")
@@ -1235,10 +1241,10 @@ class H7ToolMcp:
     def read_hid_target_memory(self, address: int, length: int) -> dict[str, Any]:
         return self.hid_modbus.run_read_memory_script(address, length)
 
-    def target_identity(self) -> dict[str, Any]:
+    def target_identity(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.adapter.kind != "h7tool_hid":
             raise BridgeError("target_identity currently requires adapter.type = h7tool_hid")
-        profile = read_target_profile(self.config)
+        profile = read_selected_target_profile(self.config, arguments)
         probe = self.read_hid_target_probe()
         probe_data = probe["result"]["data"]
         expected_idcode = profile.get("expected_idcode")
@@ -1311,7 +1317,7 @@ class H7ToolMcp:
                 return self.read_hid_target_probe()
             return self.run_configured_command("target_probe", arguments)
         if name == "target_identity":
-            return self.target_identity()
+            return self.target_identity(arguments)
         if name == "log_tail":
             source = str(arguments.get("source", ""))
             if source not in {"uart", "rtt", "can"}:
@@ -1402,8 +1408,17 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "target_identity",
-        "description": "Build a read-only target identity profile by combining the selected local H7-TOOL device Lua metadata with the verified HID STM32H7 UID probe.",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "description": "Build a read-only target identity profile by combining selected local H7-TOOL device Lua metadata with the verified HID STM32H7 UID probe. Selection accepts relative_path or vendor/series/device; omitted uses config/default profile.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "vendor": {"type": "string"},
+                "series": {"type": "string"},
+                "device": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
     },
     {
         "name": "tool_registers",
@@ -1576,6 +1591,11 @@ def self_test(_server: H7ToolMcp) -> int:
     assert any(item["relative_path"] == "ST/STM32H7xx/STM32H7x_2M.lua" for item in fuzzy_search["matches"])
     device_profile = read_device_profile({"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"})
     assert device_profile["expected_idcode"] == "0x6BA02477"
+    selected_profile = read_selected_target_profile(
+        {"adapter": {}},
+        {"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"},
+    )
+    assert selected_profile["relative_path"] == "ST/STM32H7xx/STM32H7x_2M.lua"
     try:
         server.call_tool("read_memory", {"address": "0x20000000", "length": 4096})
     except BridgeError:
@@ -1607,7 +1627,7 @@ def main() -> int:
     parser.add_argument("--health-summary", action="store_true", help="Run the configured conservative read-only health assessment and print JSON")
     parser.add_argument("--lua-health", action="store_true", help="Run the bundled read-only Lua health script through the configured HID adapter")
     parser.add_argument("--target-probe", action="store_true", help="Run the configured read-only target probe and print JSON")
-    parser.add_argument("--target-identity", action="store_true", help="Run the read-only target identity profile and print JSON")
+    parser.add_argument("--target-identity", nargs="?", const="", metavar="RELATIVE_PATH", help="Run the read-only target identity profile; optionally select a local device Lua relative path")
     parser.add_argument("--read-memory", nargs=2, metavar=("ADDRESS", "LENGTH"), help="Read a bounded target memory range through the configured adapter")
     parser.add_argument("--tool-registers", nargs=2, metavar=("ADDRESS", "COUNT"), help="Read bounded H7-TOOL holding registers through the configured Modbus adapter")
     args = parser.parse_args()
@@ -1664,9 +1684,10 @@ def main() -> int:
         except BridgeError as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
             return 2
-    if args.target_identity:
+    if args.target_identity is not None:
         try:
-            print(json.dumps(server.call_tool("target_identity", {}), ensure_ascii=False, indent=2))
+            identity_args = {"relative_path": args.target_identity} if args.target_identity else {}
+            print(json.dumps(server.call_tool("target_identity", identity_args), ensure_ascii=False, indent=2))
             return 0
         except BridgeError as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
