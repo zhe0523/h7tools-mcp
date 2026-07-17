@@ -19,5 +19,10 @@
   "limits": {
     "max_read_memory_bytes": 1024,
     "max_log_lines": 200
+  },
+  "dangerous_actions": {
+    "enabled": false,
+    "allowed_levels": [],
+    "confirmation_phrase": "I understand this may modify or erase hardware"
   }
 }

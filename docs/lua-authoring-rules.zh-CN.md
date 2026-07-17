@@ -21,6 +21,23 @@ AI 可以先把 Lua 写成离线草稿，而不是直接执行：
 
 草稿保存在本地 `workspace/lua_drafts/`，该目录不提交到 git。草稿工具不会执行 Lua，也不会访问硬件。
 
+## 危险动作门禁
+
+烧录、擦除、解锁、改保护、供电控制、执行自定义 Lua 等动作属于危险动作。相关功能接入时必须先检查 `dangerous_action_policy`：
+
+- `dangerous_actions.enabled` 必须为 `true`。
+- 动作级别必须出现在 `dangerous_actions.allowed_levels` 中。
+- 每次请求都必须提供与 `confirmation_phrase` 完全一致的确认短语。
+
+当前门禁级别包括：
+
+- `write`：写寄存器、写 EEPROM、写外设状态等。
+- `erase`：擦除 Flash、EEPROM、外部 Flash 等。
+- `program`：烧录目标或外部存储器。
+- `protection`：改 Option Byte、读保护、安全锁等。
+- `power`：目标供电、复位、电源时序。
+- `raw_lua`：执行自定义 Lua 脚本。
+
 ## 输出格式
 
 建议所有 AI 编写的 Lua 辅助脚本都使用类似结构：

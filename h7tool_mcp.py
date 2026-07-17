@@ -46,6 +46,7 @@ def load_config(path: Path) -> dict[str, Any]:
             "adapter": {"type": "mock"},
             "commands": {},
             "limits": {"max_read_memory_bytes": 1024, "max_log_lines": 200},
+            "dangerous_actions": {"enabled": False},
         }
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
@@ -56,8 +57,12 @@ def load_config(path: Path) -> dict[str, Any]:
     config.setdefault("adapter", {"type": "mock"})
     config.setdefault("commands", {})
     config.setdefault("limits", {})
+    config.setdefault("dangerous_actions", {})
     config["limits"].setdefault("max_read_memory_bytes", 1024)
     config["limits"].setdefault("max_log_lines", 200)
+    config["dangerous_actions"].setdefault("enabled", False)
+    config["dangerous_actions"].setdefault("confirmation_phrase", "I understand this may modify or erase hardware")
+    config["dangerous_actions"].setdefault("allowed_levels", [])
     return config
 
 
@@ -998,6 +1003,89 @@ def lua_draft_validate(arguments: dict[str, Any]) -> dict[str, Any]:
         draft = path.read_text(encoding="utf-8", errors="replace")
         return {"source": path.name, "validation": validate_lua_draft_text(draft)}
     raise BridgeError("Provide either content or name")
+
+
+DANGEROUS_ACTION_LEVELS: dict[str, dict[str, Any]] = {
+    "write": {
+        "label": "write",
+        "description": "Writes data to an external device, target memory, EEPROM, or registers.",
+        "risks": ["May change device state", "May require a reset or power cycle to recover"],
+    },
+    "erase": {
+        "label": "erase",
+        "description": "Erases target flash, external flash, EEPROM, or another nonvolatile region.",
+        "risks": ["Data loss", "Target may stop booting until reprogrammed"],
+    },
+    "program": {
+        "label": "program",
+        "description": "Programs firmware or data into target or external nonvolatile memory.",
+        "risks": ["Can overwrite firmware", "Bad images can brick or stall the target"],
+    },
+    "protection": {
+        "label": "protection",
+        "description": "Changes readout protection, option bytes, security, or lock state.",
+        "risks": ["May permanently restrict access", "May require mass erase or special recovery"],
+    },
+    "power": {
+        "label": "power",
+        "description": "Controls target power, reset, or power sequencing.",
+        "risks": ["Can interrupt active programming", "Can reset or disrupt connected hardware"],
+    },
+    "raw_lua": {
+        "label": "raw_lua",
+        "description": "Runs custom Lua beyond the prebuilt bounded MCP tools.",
+        "risks": ["Script behavior depends on its content", "Can combine multiple risky operations"],
+    },
+}
+
+
+def dangerous_action_policy(config: dict[str, Any]) -> dict[str, Any]:
+    policy = config.get("dangerous_actions", {})
+    if not isinstance(policy, dict):
+        policy = {}
+    enabled = bool(policy.get("enabled", False))
+    allowed_levels = policy.get("allowed_levels", [])
+    if not isinstance(allowed_levels, list):
+        allowed_levels = []
+    allowed = [str(item) for item in allowed_levels if str(item) in DANGEROUS_ACTION_LEVELS]
+    return {
+        "enabled": enabled,
+        "allowed_levels": allowed,
+        "available_levels": list(DANGEROUS_ACTION_LEVELS.keys()),
+        "confirmation_phrase": str(policy.get("confirmation_phrase", "I understand this may modify or erase hardware")),
+        "default": "disabled",
+        "notes": [
+            "Dangerous actions are denied unless enabled in config.json.",
+            "A matching confirmation phrase is required per request.",
+            "This policy is a gate for future write/erase/program/protection/power/raw_lua tools; it does not execute anything by itself.",
+        ],
+    }
+
+
+def dangerous_action_explain(arguments: dict[str, Any]) -> dict[str, Any]:
+    level = str(arguments.get("level", "")).strip().lower()
+    if not level:
+        return {"levels": DANGEROUS_ACTION_LEVELS}
+    if level not in DANGEROUS_ACTION_LEVELS:
+        raise BridgeError("level must be one of: " + ", ".join(DANGEROUS_ACTION_LEVELS))
+    return {"level": level, "details": DANGEROUS_ACTION_LEVELS[level]}
+
+
+def require_dangerous_confirmation(
+    config: dict[str, Any],
+    level: str,
+    confirmation: str,
+) -> dict[str, Any]:
+    policy = dangerous_action_policy(config)
+    if level not in DANGEROUS_ACTION_LEVELS:
+        raise BridgeError("unknown dangerous action level")
+    if not policy["enabled"]:
+        raise BridgeError("dangerous actions are disabled in config.json")
+    if level not in policy["allowed_levels"]:
+        raise BridgeError(f"dangerous action level is not allowed by config.json: {level}")
+    if confirmation != policy["confirmation_phrase"]:
+        raise BridgeError("confirmation phrase did not match the configured dangerous action policy")
+    return {"allowed": True, "level": level}
 
 
 def resolve_device_script(arguments: dict[str, Any]) -> Path:
@@ -2992,6 +3080,10 @@ class H7ToolMcp:
             return lua_draft_read(arguments)
         if name == "lua_draft_validate":
             return lua_draft_validate(arguments)
+        if name == "dangerous_action_policy":
+            return dangerous_action_policy(self.config)
+        if name == "dangerous_action_explain":
+            return dangerous_action_explain(arguments)
         if name == "device_profile":
             return read_device_profile(arguments)
         if name == "device_capabilities":
@@ -3146,6 +3238,22 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "name": {"type": "string", "description": "Saved draft name to validate."},
                 "content": {"type": "string", "description": "Unsaved Lua text to validate."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "dangerous_action_policy",
+        "description": "Show whether dangerous write/erase/program/protection/power/raw_lua actions are enabled and which levels are allowed. Does not execute anything.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "dangerous_action_explain",
+        "description": "Explain a dangerous action level and its risks. Does not execute anything.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "level": {"type": "string", "enum": ["write", "erase", "program", "protection", "power", "raw_lua"], "description": "Optional level to explain. Omit to list all levels."},
             },
             "additionalProperties": False,
         },
@@ -3693,6 +3801,22 @@ def self_test(_server: H7ToolMcp) -> int:
         _lua_draft_path("self_test.lua").unlink()
     except OSError:
         pass
+    policy = dangerous_action_policy(server.config)
+    assert policy["enabled"] is False
+    try:
+        require_dangerous_confirmation(server.config, "erase", policy["confirmation_phrase"])
+    except BridgeError:
+        pass
+    else:
+        raise AssertionError("disabled dangerous action policy allowed erase")
+    enabled_config = load_config(Path("__nonexistent_mock_config__.json"))
+    enabled_config["dangerous_actions"] = {
+        "enabled": True,
+        "allowed_levels": ["erase"],
+        "confirmation_phrase": "CONFIRM",
+    }
+    assert require_dangerous_confirmation(enabled_config, "erase", "CONFIRM")["allowed"] is True
+    assert dangerous_action_explain({"level": "erase"})["details"]["risks"]
     device_profile = read_device_profile({"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"})
     assert device_profile["expected_idcode"] == "0x6BA02477"
     caps = device_capabilities({"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"})
@@ -3787,6 +3911,8 @@ def main() -> int:
     parser.add_argument("--lua-draft-list", action="store_true", help="List offline Lua drafts")
     parser.add_argument("--lua-draft-read", metavar="NAME", help="Read one offline Lua draft")
     parser.add_argument("--lua-draft-validate", metavar="NAME", help="Validate one offline Lua draft")
+    parser.add_argument("--dangerous-action-policy", action="store_true", help="Show dangerous action gate policy")
+    parser.add_argument("--dangerous-action-explain", choices=["write", "erase", "program", "protection", "power", "raw_lua"], help="Explain one dangerous action level")
     parser.add_argument("--device-profile", metavar="RELATIVE_PATH", help="Parse one local H7-TOOL device Lua profile")
     parser.add_argument("--device-capabilities", metavar="RELATIVE_PATH", help="Inspect one local H7-TOOL device Lua profile and summarize inferred capabilities")
     parser.add_argument("--self-test", action="store_true", help="Test MCP logic using only the built-in mock adapter")
@@ -3902,6 +4028,12 @@ def main() -> int:
     server = H7ToolMcp(config, args.config)
     if args.self_test:
         return self_test(server)
+    if args.dangerous_action_policy:
+        print(json.dumps(dangerous_action_policy(config), ensure_ascii=False, indent=2))
+        return 0
+    if args.dangerous_action_explain is not None:
+        print(json.dumps(dangerous_action_explain({"level": args.dangerous_action_explain}), ensure_ascii=False, indent=2))
+        return 0
     if args.probe_h7tool:
         try:
             print(json.dumps(server.call_tool("tool_status", {}), ensure_ascii=False, indent=2))
