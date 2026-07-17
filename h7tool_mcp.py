@@ -133,6 +133,46 @@ def parse_read_memory_output(raw: bytes) -> dict[str, Any]:
     return {"raw": text, "format": "h7tool_read_memory", "data": data}
 
 
+def parse_option_bytes_output(raw: bytes) -> dict[str, Any]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    data: dict[str, Any] = {"entries": []}
+    entries: list[dict[str, Any]] = data["entries"]
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key == "read_count":
+            try:
+                data["read_count"] = int(float(value))
+            except ValueError:
+                data["read_count"] = value
+            continue
+        match = re.fullmatch(r"ob\[(\d+)\]", key)
+        if match:
+            parts = value.split()
+            if len(parts) >= 3:
+                entries.append(
+                    {
+                        "index": int(match.group(1)),
+                        "address": parts[0].upper().replace("X", "x"),
+                        "read": _parse_lua_number(parts[1]),
+                        "value": parts[2].upper(),
+                    }
+                )
+    data["ok"] = bool(entries) and len(entries) == data.get("read_count") and all(entry.get("read") == 1 for entry in entries)
+    data["data_hex"] = " ".join(str(entry["value"]) for entry in entries)
+    return {"raw": text, "format": "h7tool_option_bytes", "data": data}
+
+
+def _parse_lua_number(value: str) -> int | str:
+    try:
+        return int(float(value))
+    except ValueError:
+        return value
+
+
 def _safe_int_expr(expr: str) -> int | None:
     """Evaluate the small integer expressions used in H7-TOOL Lua metadata."""
     try:
@@ -170,6 +210,13 @@ def parse_lua_target_profile(script_path: Path, text: str) -> dict[str, Any]:
         match = re.search(rf"(?m)^\s*{name}\s*=\s*([^\r\n-]+)", text)
         return _safe_int_expr(match.group(1).strip()) if match else None
 
+    def string_assignment(name: str) -> str | None:
+        match = re.search(rf"(?ms)^\s*{name}\s*=\s*(?P<body>.*?)(?:\n\s*[A-Za-z_][A-Za-z0-9_]*\s*=|\n\s*end\b)", text)
+        if not match:
+            return None
+        body = match.group("body")
+        return " ".join(re.findall(r"\"([0-9A-Fa-fxX\s]+)\"", body))
+
     include_list: list[str] = []
     include_match = re.search(r"IncludeList\s*=\s*\{(?P<body>.*?)\}", text, flags=re.S)
     if include_match:
@@ -190,6 +237,7 @@ def parse_lua_target_profile(script_path: Path, text: str) -> dict[str, Any]:
     uid_addr = int_value("UID_ADDR")
     uid_bytes = int_value("UID_BYTES")
     mcu_id = int_value("MCU_ID")
+    ob_address = string_assignment("OB_ADDRESS")
     return {
         "source": str(script_path),
         "relative_path": _relative_device_path(script_path),
@@ -204,9 +252,17 @@ def parse_lua_target_profile(script_path: Path, text: str) -> dict[str, Any]:
         "ram_address": _format_hex(int_value("RAM_ADDRESS"), 8),
         "algorithm_ram_address": _format_hex(int_value("AlgoRamAddr"), 8),
         "algorithm_ram_size_bytes": int_value("AlgoRamSize"),
+        "option_byte_addresses": parse_ob_address_string(ob_address) if ob_address else [],
         "include_list": include_list,
         "algorithm_files": algo_entries,
     }
+
+
+def parse_ob_address_string(value: str) -> list[str]:
+    addresses: list[str] = []
+    for token in re.findall(r"[0-9A-Fa-f]{8}", value):
+        addresses.append(f"0x{int(token, 16):08X}")
+    return addresses
 
 
 def _relative_device_path(script_path: Path) -> str | None:
@@ -1295,6 +1351,28 @@ print("H7TOOL_MEM_END")
         result["result"] = parse_read_memory_output(result["result"]["raw"].encode("utf-8", errors="replace"))
         return result
 
+    def run_read_option_bytes_script(self, addresses: list[int]) -> dict[str, Any]:
+        if not addresses:
+            raise BridgeError("Selected device profile does not define option byte addresses")
+        if len(addresses) > 256:
+            raise BridgeError("Refusing to read more than 256 option byte addresses")
+        lua_addresses = ",".join(f"0x{address:08X}" for address in addresses)
+        script = f"""print("H7TOOL_OB_BEGIN")
+local A={{{lua_addresses}}}
+if pg_init then local r=pg_init() if r==nil then print("pg_init=nil") else print("pg_init="..r) end end
+print("read_count="..#A)
+for i=1,#A do
+ local ok,b=pg_read_mem(A[i],1)
+ local v="??"
+ if ok==1 and b then v=string.format("%02X",string.byte(b,1)) end
+ print(string.format("ob[%d]=0x%08X %s %s",i-1,A[i],ok,v))
+end
+print("H7TOOL_OB_END")
+""".encode("ascii")
+        result = self._run_lua_script(script, "generated/read_option_bytes.lua", b"H7TOOL_OB_BEGIN", b"H7TOOL_OB_END")
+        result["result"] = parse_option_bytes_output(result["result"]["raw"].encode("utf-8", errors="replace"))
+        return result
+
 
 class H7ToolMcp:
     def __init__(self, config: dict[str, Any], config_path: Path) -> None:
@@ -1386,6 +1464,27 @@ class H7ToolMcp:
     def read_hid_target_memory(self, address: int, length: int) -> dict[str, Any]:
         return self.hid_modbus.run_read_memory_script(address, length)
 
+    def read_option_bytes(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError("read_option_bytes currently requires adapter.type = h7tool_hid")
+        profile = read_selected_target_profile(self.config, arguments)
+        address_texts = profile.get("option_byte_addresses", [])
+        if not isinstance(address_texts, list) or not address_texts:
+            raise BridgeError("Selected device profile does not define option byte addresses")
+        addresses: list[int] = []
+        for item in address_texts:
+            if not isinstance(item, str):
+                continue
+            addresses.append(int(item, 16))
+        result = self.hid_modbus.run_read_option_bytes_script(addresses)
+        result["profile"] = {
+            "relative_path": profile.get("relative_path"),
+            "vendor": profile.get("vendor"),
+            "series": profile.get("series"),
+            "device": profile.get("device"),
+        }
+        return result
+
     def target_identity(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.adapter.kind != "h7tool_hid":
             raise BridgeError("target_identity currently requires adapter.type = h7tool_hid")
@@ -1465,6 +1564,8 @@ class H7ToolMcp:
             return self.run_configured_command("target_probe", arguments)
         if name == "target_identity":
             return self.target_identity(arguments)
+        if name == "read_option_bytes":
+            return self.read_option_bytes(arguments)
         if name == "log_tail":
             source = str(arguments.get("source", ""))
             if source not in {"uart", "rtt", "can"}:
@@ -1591,6 +1692,20 @@ TOOLS: list[dict[str, Any]] = [
                 "count": {"type": "integer", "minimum": 1, "maximum": 60},
             },
             "required": ["address", "count"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "read_option_bytes",
+        "description": "Read option-byte addresses from the selected local device profile over verified HID Lua pg_read_mem. Read-only; no option-byte programming, protection changes, erase, reset, or power control.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "vendor": {"type": "string"},
+                "series": {"type": "string"},
+                "device": {"type": "string"},
+            },
             "additionalProperties": False,
         },
     },
@@ -1735,6 +1850,11 @@ def self_test(_server: H7ToolMcp) -> int:
     )
     assert memory["data"]["ok"] is True
     assert memory["data"]["data_bytes"] == ["12", "34", "AB", "CD"]
+    ob = parse_option_bytes_output(
+        b"H7TOOL_OB_BEGIN\nread_count=2\nob[0]=0x52002020 1.0 F0\nob[1]=0x52002021 1.0 AA\nH7TOOL_OB_END\n"
+    )
+    assert ob["data"]["ok"] is True
+    assert ob["data"]["data_hex"] == "F0 AA"
     profile = parse_lua_target_profile(
         Path("Device/ST/STM32H7xx/STM32H7x_2M.lua"),
         'CHIP_TYPE = "SWD"\nMCU_ID = 0x6BA02477\nUID_ADDR = 0x1FF1E800\nUID_BYTES = 12\n'
@@ -1743,6 +1863,7 @@ def self_test(_server: H7ToolMcp) -> int:
     assert profile["expected_idcode"] == "0x6BA02477"
     assert profile["uid_address"] == "0x1FF1E800"
     assert profile["algorithm_ram_size_bytes"] == 128 * 1024
+    assert parse_ob_address_string("52002020 52002021") == ["0x52002020", "0x52002021"]
     vendors = device_vendors()
     assert vendors["total_lua"] > 1000
     assert any(item["vendor"] == "ST" for item in vendors["vendors"])
@@ -1794,6 +1915,7 @@ def main() -> int:
     parser.add_argument("--lua-health", action="store_true", help="Run the bundled read-only Lua health script through the configured HID adapter")
     parser.add_argument("--target-probe", action="store_true", help="Run the configured read-only target probe and print JSON")
     parser.add_argument("--target-identity", nargs="?", const="", metavar="RELATIVE_PATH", help="Run the read-only target identity profile; optionally select a local device Lua relative path")
+    parser.add_argument("--read-option-bytes", nargs="?", const="", metavar="RELATIVE_PATH", help="Read option bytes using a selected local device Lua profile")
     parser.add_argument("--read-memory", nargs=2, metavar=("ADDRESS", "LENGTH"), help="Read a bounded target memory range through the configured adapter")
     parser.add_argument("--tool-registers", nargs=2, metavar=("ADDRESS", "COUNT"), help="Read bounded H7-TOOL holding registers through the configured Modbus adapter")
     args = parser.parse_args()
@@ -1857,6 +1979,14 @@ def main() -> int:
         try:
             identity_args = {"relative_path": args.target_identity} if args.target_identity else {}
             print(json.dumps(server.call_tool("target_identity", identity_args), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.read_option_bytes is not None:
+        try:
+            ob_args = {"relative_path": args.read_option_bytes} if args.read_option_bytes else {}
+            print(json.dumps(server.call_tool("read_option_bytes", ob_args), ensure_ascii=False, indent=2))
             return 0
         except BridgeError as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)

@@ -126,6 +126,11 @@ template containing only validated numeric address/length values and calls
 `pg_read_mem`; MCP callers cannot provide arbitrary Lua. Changing those limits
 does not permit any write action.
 
+`read_option_bytes` uses the selected local device profile's parsed
+`OB_ADDRESS` byte list and reads each address with `pg_read_mem(addr, 1)`.
+It intentionally does not call option-byte programming APIs, protection
+changes, erase, reset, power, or arbitrary Lua.
+
 ## Health summary
 
 `health_summary` evaluates only H7-TOOL's own TVCC and USB 5V supplies using
