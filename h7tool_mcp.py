@@ -31,6 +31,7 @@ DEVICE_ROOT = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL" / "Pro
 H7TOOL_ROOT = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL"
 LUA_EXAMPLE_ROOT = H7TOOL_ROOT / "Lua"
 USB_BUS_ROOT = Path(__file__).resolve().parent.parent / "USBBus"
+LUA_DRAFT_ROOT = Path(__file__).resolve().parent / "workspace" / "lua_drafts"
 DEFAULT_TARGET_LUA = DEVICE_ROOT / "ST" / "STM32H7xx" / "STM32H7x_2M.lua"
 DEFAULT_RTT_RANGES = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL" / "Config" / "rtt_address.txt"
 
@@ -878,6 +879,125 @@ def lua_authoring_rules() -> dict[str, Any]:
             ],
         },
     }
+
+
+def _safe_lua_draft_name(name: str) -> str:
+    cleaned = name.strip().replace("\\", "/").split("/")[-1]
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", cleaned)
+    if not cleaned:
+        raise BridgeError("draft name must not be empty")
+    if not cleaned.lower().endswith(".lua"):
+        cleaned += ".lua"
+    if cleaned in {".lua", "..lua"} or cleaned.startswith("."):
+        raise BridgeError("draft name must be a visible .lua file")
+    return cleaned
+
+
+def _lua_draft_path(name: str) -> Path:
+    safe_name = _safe_lua_draft_name(name)
+    root = LUA_DRAFT_ROOT.resolve()
+    path = (root / safe_name).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise BridgeError("draft path must stay inside the Lua draft workspace") from exc
+    return path
+
+
+def lua_draft_create(arguments: dict[str, Any]) -> dict[str, Any]:
+    name = str(arguments.get("name", "")).strip()
+    content = arguments.get("content")
+    overwrite = bool(arguments.get("overwrite", False))
+    if not isinstance(content, str) or not content.strip():
+        raise BridgeError("content must be a non-empty Lua script string")
+    if len(content.encode("utf-8")) > 64 * 1024:
+        raise BridgeError("Lua draft content is limited to 64 KiB")
+    path = _lua_draft_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and not overwrite:
+        raise BridgeError(f"Lua draft already exists: {path.name}; pass overwrite=true to replace it")
+    path.write_text(content, encoding="utf-8", newline="\n")
+    validation = validate_lua_draft_text(content)
+    return {
+        "draft_root": str(LUA_DRAFT_ROOT),
+        "name": path.name,
+        "relative_path": f"workspace/lua_drafts/{path.name}",
+        "bytes": len(content.encode("utf-8")),
+        "validation": validation,
+    }
+
+
+def lua_draft_list() -> dict[str, Any]:
+    drafts: list[dict[str, Any]] = []
+    if LUA_DRAFT_ROOT.exists():
+        for path in sorted(LUA_DRAFT_ROOT.glob("*.lua")):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            drafts.append({"name": path.name, "relative_path": f"workspace/lua_drafts/{path.name}", "bytes": stat.st_size})
+    return {"draft_root": str(LUA_DRAFT_ROOT), "drafts": drafts, "count": len(drafts)}
+
+
+def lua_draft_read(arguments: dict[str, Any]) -> dict[str, Any]:
+    path = _lua_draft_path(str(arguments.get("name", "")))
+    if not path.exists():
+        raise BridgeError(f"Lua draft not found: {path.name}")
+    content = path.read_text(encoding="utf-8", errors="replace")
+    return {
+        "draft_root": str(LUA_DRAFT_ROOT),
+        "name": path.name,
+        "relative_path": f"workspace/lua_drafts/{path.name}",
+        "content": content,
+        "validation": validate_lua_draft_text(content),
+    }
+
+
+def validate_lua_draft_text(content: str) -> dict[str, Any]:
+    warnings: list[str] = []
+    errors: list[str] = []
+    lowered = content.lower()
+    if len(content.encode("utf-8")) > 64 * 1024:
+        errors.append("script exceeds 64 KiB")
+    if "begin" not in lowered or "end" not in lowered:
+        warnings.append("script should print unique BEGIN and END markers")
+    if not re.search(r'print\s*\(\s*["\'][A-Za-z0-9_:-]*BEGIN[A-Za-z0-9_:-]*["\']', content):
+        warnings.append("missing obvious printed BEGIN marker")
+    if not re.search(r'print\s*\(\s*["\'][A-Za-z0-9_:-]*END[A-Za-z0-9_:-]*["\']', content):
+        warnings.append("missing obvious printed END marker")
+    if not re.search(r'print\s*\([^)]*=', content):
+        warnings.append("script should print machine-readable key=value fields")
+    if re.search(r"\bwhile\s+true\b|\brepeat\b", lowered):
+        warnings.append("script contains a potentially unbounded loop")
+    if re.search(r"\bfor\s+[^=]+=\s*[^,]+,\s*[^,]+,\s*0\s+do\b", lowered):
+        errors.append("for loop step must not be zero")
+    dangerous_patterns = {
+        "erase": r"\berase[_a-z0-9]*\s*\(",
+        "program": r"\b(?:program|download|write_flash|pg_write|pg_program)[_a-z0-9]*\s*\(",
+        "unlock": r"\b(?:unlock|unprotect|remove_protect)[_a-z0-9]*\s*\(",
+        "option_bytes": r"\b(?:ob_|option|write_ob)[_a-z0-9]*",
+        "power_control": r"\b(?:poweroff|power_on|power_off|target_power)[_a-z0-9]*\s*\(",
+    }
+    dangerous = [name for name, pattern in dangerous_patterns.items() if re.search(pattern, lowered)]
+    if dangerous:
+        errors.append("potentially dangerous operations detected: " + ", ".join(dangerous))
+    apis = sorted(set(re.findall(r"\b(?:i2c_bus|spi_bus|uart_\w+|can_bus|pg_\w+|gpio_\w+)\s*\(", content)))
+    return {"ok": not errors, "errors": errors, "warnings": warnings, "api_calls": [item[:-1] for item in apis]}
+
+
+def lua_draft_validate(arguments: dict[str, Any]) -> dict[str, Any]:
+    content = arguments.get("content")
+    name = arguments.get("name")
+    if isinstance(content, str) and content:
+        validation = validate_lua_draft_text(content)
+        return {"source": "content", "validation": validation}
+    if isinstance(name, str) and name.strip():
+        path = _lua_draft_path(name)
+        if not path.exists():
+            raise BridgeError(f"Lua draft not found: {path.name}")
+        draft = path.read_text(encoding="utf-8", errors="replace")
+        return {"source": path.name, "validation": validate_lua_draft_text(draft)}
+    raise BridgeError("Provide either content or name")
 
 
 def resolve_device_script(arguments: dict[str, Any]) -> Path:
@@ -2864,6 +2984,14 @@ class H7ToolMcp:
             )
         if name == "lua_authoring_rules":
             return lua_authoring_rules()
+        if name == "lua_draft_create":
+            return lua_draft_create(arguments)
+        if name == "lua_draft_list":
+            return lua_draft_list()
+        if name == "lua_draft_read":
+            return lua_draft_read(arguments)
+        if name == "lua_draft_validate":
+            return lua_draft_validate(arguments)
         if name == "device_profile":
             return read_device_profile(arguments)
         if name == "device_capabilities":
@@ -2980,6 +3108,47 @@ TOOLS: list[dict[str, Any]] = [
         "name": "lua_authoring_rules",
         "description": "Return public safety and style rules for AI-authored H7-TOOL Lua helper scripts. Pure guidance; no hardware access.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "lua_draft_create",
+        "description": "Create or replace an offline Lua draft under workspace/lua_drafts. Does not execute Lua or contact hardware.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Draft filename. Sanitized to a .lua file in workspace/lua_drafts."},
+                "content": {"type": "string", "description": "Lua script content."},
+                "overwrite": {"type": "boolean", "default": False},
+            },
+            "required": ["name", "content"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "lua_draft_list",
+        "description": "List offline Lua drafts under workspace/lua_drafts. Does not execute Lua or contact hardware.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "lua_draft_read",
+        "description": "Read one offline Lua draft and validate it. Does not execute Lua or contact hardware.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "lua_draft_validate",
+        "description": "Validate Lua draft text or a saved draft for basic structure and risky operations. Does not execute Lua or contact hardware.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Saved draft name to validate."},
+                "content": {"type": "string", "description": "Unsaved Lua text to validate."},
+            },
+            "additionalProperties": False,
+        },
     },
     {
         "name": "device_profile",
@@ -3513,6 +3682,17 @@ def self_test(_server: H7ToolMcp) -> int:
     authoring_rules = lua_authoring_rules()
     assert authoring_rules["workflow"]
     assert "i2c_register_read" in authoring_rules["templates"]
+    draft_content = 'print("H7TOOL_USER_BEGIN")\nprint("ok=1")\nprint("H7TOOL_USER_END")\n'
+    draft = lua_draft_create({"name": "self_test.lua", "content": draft_content, "overwrite": True})
+    assert draft["validation"]["ok"] is True
+    assert any(item["name"] == "self_test.lua" for item in lua_draft_list()["drafts"])
+    assert lua_draft_read({"name": "self_test.lua"})["content"] == draft_content
+    dangerous = lua_draft_validate({"content": 'print("BEGIN")\nerase_chip()\nprint("END")\n'})
+    assert dangerous["validation"]["ok"] is False
+    try:
+        _lua_draft_path("self_test.lua").unlink()
+    except OSError:
+        pass
     device_profile = read_device_profile({"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"})
     assert device_profile["expected_idcode"] == "0x6BA02477"
     caps = device_capabilities({"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"})
@@ -3604,6 +3784,9 @@ def main() -> int:
     parser.add_argument("--lua-example-limit", type=int, default=30, help="Maximum Lua example search results")
     parser.add_argument("--include-programmer-profiles", action="store_true", help="Include SPI-Flash and I2C-EEPROM programmer profiles in --lua-example-search")
     parser.add_argument("--lua-authoring-rules", action="store_true", help="Print public rules for AI-authored H7-TOOL Lua helper scripts")
+    parser.add_argument("--lua-draft-list", action="store_true", help="List offline Lua drafts")
+    parser.add_argument("--lua-draft-read", metavar="NAME", help="Read one offline Lua draft")
+    parser.add_argument("--lua-draft-validate", metavar="NAME", help="Validate one offline Lua draft")
     parser.add_argument("--device-profile", metavar="RELATIVE_PATH", help="Parse one local H7-TOOL device Lua profile")
     parser.add_argument("--device-capabilities", metavar="RELATIVE_PATH", help="Inspect one local H7-TOOL device Lua profile and summarize inferred capabilities")
     parser.add_argument("--self-test", action="store_true", help="Test MCP logic using only the built-in mock adapter")
@@ -3699,6 +3882,15 @@ def main() -> int:
         return 0
     if args.lua_authoring_rules:
         print(json.dumps(lua_authoring_rules(), ensure_ascii=False, indent=2))
+        return 0
+    if args.lua_draft_list:
+        print(json.dumps(lua_draft_list(), ensure_ascii=False, indent=2))
+        return 0
+    if args.lua_draft_read is not None:
+        print(json.dumps(lua_draft_read({"name": args.lua_draft_read}), ensure_ascii=False, indent=2))
+        return 0
+    if args.lua_draft_validate is not None:
+        print(json.dumps(lua_draft_validate({"name": args.lua_draft_validate}), ensure_ascii=False, indent=2))
         return 0
     if args.device_profile is not None:
         print(json.dumps(read_device_profile({"relative_path": args.device_profile}), ensure_ascii=False, indent=2))

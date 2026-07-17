@@ -10,6 +10,17 @@
 4. 让脚本输出稳定的 `key=value` 字段，方便 AI 或 MCP 层解析。
 5. 一次只让一个程序控制同一个 H7-TOOL 操作通道。
 
+## 草稿工作区
+
+AI 可以先把 Lua 写成离线草稿，而不是直接执行：
+
+- `lua_draft_create`：创建或覆盖草稿。
+- `lua_draft_list`：列出草稿。
+- `lua_draft_read`：读取草稿并返回校验结果。
+- `lua_draft_validate`：校验草稿文本或已保存草稿。
+
+草稿保存在本地 `workspace/lua_drafts/`，该目录不提交到 git。草稿工具不会执行 Lua，也不会访问硬件。
+
 ## 输出格式
 
 建议所有 AI 编写的 Lua 辅助脚本都使用类似结构：

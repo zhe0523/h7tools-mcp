@@ -13,6 +13,7 @@ The public documentation only covers installation and usage. Product-internal co
 - Searches the local H7-TOOL device Lua library by vendor, series, or chip name.
 - Searches bundled H7-TOOL Lua examples and bus helper scripts so the AI can inspect original peripheral usage.
 - Provides public safety and style rules for AI-authored H7-TOOL Lua helper scripts.
+- Provides an offline Lua draft workspace to create, list, read, and validate drafts without executing them.
 - Parses device profiles for interface type, expected ID, UID location, memory ranges, included libraries, and algorithm entries.
 - Summarizes profile capabilities so the AI can understand what a chip profile appears to support.
 - Probes a connected STM32H7 target and combines live results with the selected local profile.
@@ -83,6 +84,7 @@ python h7tool_mcp.py --device-vendors
 python h7tool_mcp.py --device-search STM32H743 --device-vendor ST
 python h7tool_mcp.py --lua-example-search BH1750 --lua-example-interface i2c
 python h7tool_mcp.py --lua-authoring-rules
+python h7tool_mcp.py --lua-draft-list
 python h7tool_mcp.py --device-profile ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --lua-health
 python h7tool_mcp.py --target-identity ST/STM32H7xx/STM32H7x_2M.lua
@@ -203,6 +205,10 @@ Use h7tool lua_authoring_rules before drafting a custom H7-TOOL Lua helper scrip
 ```
 
 ```text
+Use h7tool lua_draft_create to draft an I2C register-read Lua helper, then validate it with lua_draft_validate without executing it.
+```
+
+```text
 Use h7tool target_identity with ST/STM32H7xx/STM32H7x_2M.lua and summarize the connected target.
 ```
 
@@ -249,6 +255,10 @@ Good workflow:
 - `device_search`
 - `lua_example_search`
 - `lua_authoring_rules`
+- `lua_draft_create`
+- `lua_draft_list`
+- `lua_draft_read`
+- `lua_draft_validate`
 - `device_profile`
 - `device_capabilities`
 - `tool_status`
