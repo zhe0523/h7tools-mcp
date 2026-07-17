@@ -28,6 +28,9 @@ SERVER_VERSION = "0.3.0"
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
 DEVICE_ROOT = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL" / "Programmer" / "Device"
+H7TOOL_ROOT = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL"
+LUA_EXAMPLE_ROOT = H7TOOL_ROOT / "Lua"
+USB_BUS_ROOT = Path(__file__).resolve().parent.parent / "USBBus"
 DEFAULT_TARGET_LUA = DEVICE_ROOT / "ST" / "STM32H7xx" / "STM32H7x_2M.lua"
 DEFAULT_RTT_RANGES = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL" / "Config" / "rtt_address.txt"
 
@@ -677,6 +680,145 @@ def search_device_library(
         "vendor": vendor,
         "limit": limit,
         "include_libraries": include_libraries,
+        "matches": matches,
+        "returned": len(matches),
+    }
+
+
+def _lua_example_files(include_programmer_profiles: bool) -> list[Path]:
+    roots: list[Path] = []
+    if LUA_EXAMPLE_ROOT.exists():
+        roots.append(LUA_EXAMPLE_ROOT)
+    if USB_BUS_ROOT.exists():
+        roots.append(USB_BUS_ROOT)
+    if include_programmer_profiles and DEVICE_ROOT.exists():
+        roots.append(DEVICE_ROOT / "I2C-EEPROM")
+        roots.append(DEVICE_ROOT / "SPI-Flash")
+    files: list[Path] = []
+    for root in roots:
+        if root.exists():
+            files.extend(path for path in root.rglob("*.lua") if path.is_file())
+    return sorted(files)
+
+
+def _relative_h7tool_path(path: Path) -> str:
+    resolved = path.resolve()
+    for root in (H7TOOL_ROOT.resolve(), H7TOOL_ROOT.resolve().parent):
+        try:
+            return resolved.relative_to(root).as_posix()
+        except ValueError:
+            continue
+    return path.name
+
+
+def _read_lua_example_text(path: Path) -> str:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise BridgeError(f"Cannot read Lua example {path}: {exc}") from exc
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _detect_lua_example_interfaces(text: str, path: Path) -> list[str]:
+    lowered = (text + "\n" + path.as_posix()).lower()
+    chip_type_match = re.search(r'CHIP_TYPE\s*=\s*["\']([A-Za-z0-9_+-]+)["\']', text)
+    if chip_type_match:
+        chip_type = chip_type_match.group(1).lower()
+        if chip_type in {"i2c", "spi", "uart", "can", "rtt"}:
+            return [chip_type]
+    path_text = path.as_posix().lower()
+    if "/i2c-eeprom/" in path_text:
+        return ["i2c"]
+    if "/spi-flash/" in path_text:
+        return ["spi"]
+    detected: list[str] = []
+    checks = {
+        "i2c": ["i2c_bus", "i2c", "24c", "bh1750", "mpu6050", "bmp085", "bmp180", "mcp3421"],
+        "spi": ["spi_bus", "spi", "w25", "gd25", "mx25", "mt25"],
+        "uart": ["uart_", "uart", "com_", "modbus rtu"],
+        "can": ["can_bus", "can"],
+        "rtt": ["rtt", "segger"],
+    }
+    for name, needles in checks.items():
+        if any(needle in lowered for needle in needles):
+            detected.append(name)
+    return detected
+
+
+def _lua_example_summary(path: Path, query: str) -> dict[str, Any]:
+    text = _read_lua_example_text(path)
+    rel = _relative_h7tool_path(path)
+    interfaces = _detect_lua_example_interfaces(text, path)
+    title = path.stem
+    lines = [line.strip() for line in text.splitlines()]
+    comment_lines = []
+    for line in lines:
+        if not line.startswith("--"):
+            continue
+        cleaned = line.lstrip("- ").strip()
+        if not cleaned or cleaned in {"[[", "]]"} or re.fullmatch(r"[-_=]{4,}", cleaned):
+            continue
+        comment_lines.append(cleaned)
+    summary_lines = comment_lines[:3]
+    matched_lines: list[str] = []
+    normalized_query = query.strip().lower()
+    if normalized_query:
+        for line in lines:
+            if normalized_query in line.lower():
+                matched_lines.append(line[:160])
+                if len(matched_lines) >= 3:
+                    break
+    api_calls = sorted(set(re.findall(r"\b(?:i2c_bus|spi_bus|uart_\w+|can_bus)\s*\(", text)))
+    return {
+        "title": title,
+        "relative_path": rel,
+        "interfaces": interfaces,
+        "api_calls": [item[:-1] for item in api_calls],
+        "summary": summary_lines,
+        "matched_lines": matched_lines,
+    }
+
+
+def search_lua_examples(
+    query: str,
+    interface: str | None = None,
+    limit: int = 30,
+    include_programmer_profiles: bool = False,
+) -> dict[str, Any]:
+    normalized_query = query.strip().lower()
+    normalized_interface = interface.strip().lower() if isinstance(interface, str) and interface.strip() else None
+    allowed_interfaces = {"i2c", "spi", "uart", "can", "rtt"}
+    if normalized_interface and normalized_interface not in allowed_interfaces:
+        raise BridgeError("interface must be one of i2c, spi, uart, can, or rtt")
+    if limit < 1 or limit > 100:
+        raise BridgeError("limit must be between 1 and 100")
+    matches: list[dict[str, Any]] = []
+    for path in _lua_example_files(include_programmer_profiles):
+        text = _read_lua_example_text(path)
+        interfaces = _detect_lua_example_interfaces(text, path)
+        if normalized_interface and normalized_interface not in interfaces:
+            continue
+        haystack = f"{path.name}\n{path.as_posix()}\n{text[:20000]}".lower()
+        if normalized_query and normalized_query not in haystack:
+            continue
+        matches.append(_lua_example_summary(path, query))
+        if len(matches) >= limit:
+            break
+    return {
+        "roots": {
+            "lua_examples": str(LUA_EXAMPLE_ROOT),
+            "usb_bus": str(USB_BUS_ROOT),
+            "programmer_device": str(DEVICE_ROOT) if include_programmer_profiles else None,
+        },
+        "query": query,
+        "interface": normalized_interface,
+        "limit": limit,
+        "include_programmer_profiles": include_programmer_profiles,
         "matches": matches,
         "returned": len(matches),
     }
@@ -2657,6 +2799,13 @@ class H7ToolMcp:
                 int(arguments.get("limit", 50)),
                 bool(arguments.get("include_libraries", False)),
             )
+        if name == "lua_example_search":
+            return search_lua_examples(
+                str(arguments.get("query", "")),
+                arguments.get("interface") if isinstance(arguments.get("interface"), str) else None,
+                int(arguments.get("limit", 30)),
+                bool(arguments.get("include_programmer_profiles", False)),
+            )
         if name == "device_profile":
             return read_device_profile(arguments)
         if name == "device_capabilities":
@@ -2751,6 +2900,20 @@ TOOLS: list[dict[str, Any]] = [
                 "vendor": {"type": "string"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
                 "include_libraries": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "lua_example_search",
+        "description": "Search bundled H7-TOOL Lua examples and bus helper scripts by keyword/interface. Pure filesystem indexing; no hardware access.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "default": ""},
+                "interface": {"type": "string", "enum": ["i2c", "spi", "uart", "can", "rtt"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 30},
+                "include_programmer_profiles": {"type": "boolean", "default": False, "description": "Also search SPI-Flash and I2C-EEPROM programmer profiles."},
             },
             "additionalProperties": False,
         },
@@ -3280,6 +3443,10 @@ def self_test(_server: H7ToolMcp) -> int:
     assert any(item["relative_path"] == "ST/STM32H7xx/STM32H7x_2M.lua" for item in search["matches"])
     fuzzy_search = search_device_library("STM32H743", vendor="ST", limit=10)
     assert any(item["relative_path"] == "ST/STM32H7xx/STM32H7x_2M.lua" for item in fuzzy_search["matches"])
+    i2c_examples = search_lua_examples("BH1750", interface="i2c", limit=10)
+    assert any("BH1750" in item["title"] or "BH1750" in item["relative_path"] for item in i2c_examples["matches"])
+    spi_profiles = search_lua_examples("W25Q", interface="spi", limit=20, include_programmer_profiles=True)
+    assert any("W25Q" in item["title"] or "W25Q" in item["relative_path"] for item in spi_profiles["matches"])
     device_profile = read_device_profile({"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"})
     assert device_profile["expected_idcode"] == "0x6BA02477"
     caps = device_capabilities({"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"})
@@ -3366,6 +3533,10 @@ def main() -> int:
     parser.add_argument("--device-search", metavar="QUERY", help="Search local H7-TOOL device Lua scripts")
     parser.add_argument("--device-vendor", metavar="VENDOR", help="Restrict --device-search to one vendor")
     parser.add_argument("--include-libraries", action="store_true", help="Include shared Lib scripts in --device-search results")
+    parser.add_argument("--lua-example-search", metavar="QUERY", help="Search bundled H7-TOOL Lua examples and bus helper scripts")
+    parser.add_argument("--lua-example-interface", choices=["i2c", "spi", "uart", "can", "rtt"], help="Restrict --lua-example-search to one interface")
+    parser.add_argument("--lua-example-limit", type=int, default=30, help="Maximum Lua example search results")
+    parser.add_argument("--include-programmer-profiles", action="store_true", help="Include SPI-Flash and I2C-EEPROM programmer profiles in --lua-example-search")
     parser.add_argument("--device-profile", metavar="RELATIVE_PATH", help="Parse one local H7-TOOL device Lua profile")
     parser.add_argument("--device-capabilities", metavar="RELATIVE_PATH", help="Inspect one local H7-TOOL device Lua profile and summarize inferred capabilities")
     parser.add_argument("--self-test", action="store_true", help="Test MCP logic using only the built-in mock adapter")
@@ -3440,6 +3611,20 @@ def main() -> int:
         print(
             json.dumps(
                 search_device_library(args.device_search, args.device_vendor, include_libraries=args.include_libraries),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.lua_example_search is not None:
+        print(
+            json.dumps(
+                search_lua_examples(
+                    args.lua_example_search,
+                    args.lua_example_interface,
+                    args.lua_example_limit,
+                    include_programmer_profiles=args.include_programmer_profiles,
+                ),
                 ensure_ascii=False,
                 indent=2,
             )

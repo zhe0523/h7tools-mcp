@@ -9,6 +9,7 @@
 - 列出可用的 H7-TOOL USB 接口和本地桥接配置。
 - 读取 H7-TOOL 状态和健康信息。
 - 按厂商、系列、芯片名搜索本地 H7-TOOL 设备 Lua 库。
+- 搜索 H7-TOOL 自带 Lua 示例和总线辅助脚本，辅助 AI 查找原始外设用法。
 - 解析芯片 profile 中的接口类型、期望 ID、UID 位置、存储器范围、依赖库和算法条目。
 - 汇总 profile 能力，方便 AI 理解当前芯片配置大致支持哪些操作。
 - 探测已连接的 STM32H7 目标板，并与选定的本地 profile 合并成目标信息。
@@ -77,6 +78,7 @@ python h7tool_mcp.py --list-hid-devices
 ```powershell
 python h7tool_mcp.py --device-vendors
 python h7tool_mcp.py --device-search STM32H743 --device-vendor ST
+python h7tool_mcp.py --lua-example-search BH1750 --lua-example-interface i2c
 python h7tool_mcp.py --device-profile ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --lua-health
 python h7tool_mcp.py --target-identity ST/STM32H7xx/STM32H7x_2M.lua
@@ -199,6 +201,10 @@ codex mcp list
 ```
 
 ```text
+使用 h7tool lua_example_search 搜索 H7-TOOL 自带的 I2C BH1750 示例，并总结它的调用方式。
+```
+
+```text
 使用 h7tool target_identity，profile 选择 ST/STM32H7xx/STM32H7x_2M.lua，然后总结当前目标板信息。
 ```
 
@@ -243,6 +249,7 @@ codex mcp list
 - `bridge_status`
 - `device_vendors`
 - `device_search`
+- `lua_example_search`
 - `device_profile`
 - `device_capabilities`
 - `tool_status`

@@ -11,6 +11,7 @@ The public documentation only covers installation and usage. Product-internal co
 - Lists available H7-TOOL USB interfaces and local bridge settings.
 - Reads H7-TOOL status and health information.
 - Searches the local H7-TOOL device Lua library by vendor, series, or chip name.
+- Searches bundled H7-TOOL Lua examples and bus helper scripts so the AI can inspect original peripheral usage.
 - Parses device profiles for interface type, expected ID, UID location, memory ranges, included libraries, and algorithm entries.
 - Summarizes profile capabilities so the AI can understand what a chip profile appears to support.
 - Probes a connected STM32H7 target and combines live results with the selected local profile.
@@ -79,6 +80,7 @@ Useful local checks:
 ```powershell
 python h7tool_mcp.py --device-vendors
 python h7tool_mcp.py --device-search STM32H743 --device-vendor ST
+python h7tool_mcp.py --lua-example-search BH1750 --lua-example-interface i2c
 python h7tool_mcp.py --device-profile ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --lua-health
 python h7tool_mcp.py --target-identity ST/STM32H7xx/STM32H7x_2M.lua
@@ -189,6 +191,10 @@ Use h7tool to search the local device library for STM32H743.
 ```
 
 ```text
+Use h7tool lua_example_search to find bundled I2C BH1750 examples and summarize how they are called.
+```
+
+```text
 Use h7tool target_identity with ST/STM32H7xx/STM32H7x_2M.lua and summarize the connected target.
 ```
 
@@ -233,6 +239,7 @@ Good workflow:
 - `bridge_status`
 - `device_vendors`
 - `device_search`
+- `lua_example_search`
 - `device_profile`
 - `device_capabilities`
 - `tool_status`
