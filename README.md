@@ -1,182 +1,120 @@
-# H7-TOOL read-only diagnostic MCP bridge
+# H7-TOOL MCP Assistant
 
 [中文说明](README.zh-CN.md)
 
-This is a read-only MCP server intended for **diagnosis only**.
-It deliberately exposes no erase, flash, reset, power-control, GPIO-write, or
-protection-changing tool. It does not reverse engineer or assume H7-TOOL's
-private protocol.
+This project provides an MCP server for using H7-TOOL as an assisted embedded-development tool. It helps an AI client inspect the tool, search the local H7-TOOL device library, identify a connected target, and collect useful development diagnostics.
 
-## What works today
+The implementation is designed around the H7-TOOL files already present in a normal PC software package. It does not publish private transport details or require users to understand the underlying communication framing.
 
-- A compliant stdio MCP handshake plus `tools/list` and `tools/call`.
-- `bridge_status`, which lists local serial devices and the discovered H7-TOOL
-  HID interfaces without touching the tool.
-- Safe mock-mode tests.
-- A `modbus_tcp` adapter which implements only Modbus function `0x03` (read
-  holding registers). Its packet framing and V1.49 register map come from the
-  included historical open-source H7-TOOL firmware.
-- A `modbus_udp` adapter implementing read-only function `0x03` over the
-  current V2.33 UDP/30010 Modbus RTU framing (standard low-byte-first CRC).
-- A verified V2.33 `h7tool_hid` adapter for the current H7-TOOL USB HID
-  Communication interface: VID:C251/PID:F00A, interface 2. It implements
-  only Modbus function `0x03` reads using 1024-byte HID payload reports.
-- A verified HID Lua diagnostics path for the bundled fixed
-  `diagnostics/tool_health.lua`: function `0x64` downloads/runs the script and
-  function `0x61` is polled over HID to collect `print()` output.
+## Features
 
-The hardware-facing commands are intentionally disabled until their exact
-syntax and response framing are confirmed with the real device.
+- List H7-TOOL connection candidates and local bridge configuration.
+- Read H7-TOOL status and produce a compact health summary.
+- Search the local H7-TOOL device library by vendor, series, or chip name.
+- Parse device Lua profiles for interface type, expected ID, UID location, memory ranges, included libraries, and algorithm entries.
+- Summarize device-profile capabilities, including development-useful operations and operations that should be treated carefully.
+- Probe a connected STM32H7 target and combine the live result with a selected local profile.
+- Read bounded target memory ranges for diagnostics.
+- Read option-byte values from addresses described by a selected local profile.
+- Summarize protection status when the selected profile provides the required check rules.
 
-## Run today
+## Requirements
 
-Use the bundled Python:
+- Python 3.11+.
+- H7-TOOL PC software package with its `EMMC/H7-TOOL` directory available beside this project.
+- Optional Python packages from `requirements.txt` for USB HID or serial access.
+
+Install dependencies:
 
 ```powershell
-$py = 'C:\Users\zhe\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
-& $py .\mcp\h7tool_mcp.py --self-test
-& $py .\mcp\h7tool_mcp.py --list-serial-ports
+python -m pip install -r requirements.txt
 ```
 
-The verified V2.33 path is Ethernet/WiFi to UDP/30010. In the vendor app,
-select Ethernet/WiFi, then use the current local configuration:
+Run self-test:
 
 ```powershell
-& $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --probe-h7tool
-& $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --health-summary
-& $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --tool-registers 0x0400 6
+python h7tool_mcp.py --self-test
 ```
 
-For the USB HID path, close the vendor PC application if it is actively using
-the same HID Communication interface, then use:
+## Common Commands
+
+List visible H7-TOOL USB interfaces:
 
 ```powershell
-Copy-Item .\mcp\config.usb-hid.example.json .\mcp\config.json -Force
-& $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --probe-h7tool
-& $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --lua-health
+python h7tool_mcp.py --list-hid-devices
 ```
 
-For an Ethernet device with its LAN interface actually enabled, configure a
-Modbus adapter and test it before adding it to an MCP client:
+Inspect local device-library support:
 
 ```powershell
-& $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --probe-h7tool
+python h7tool_mcp.py --device-vendors
+python h7tool_mcp.py --device-search STM32H743 --device-vendor ST
+python h7tool_mcp.py --device-profile ST/STM32H7xx/STM32H7x_2M.lua
+python h7tool_mcp.py --device-capabilities ST/STM32H7xx/STM32H7x_2M.lua
 ```
 
-To run it in an MCP client, use this server configuration (adjust the Python
-path if the bundled runtime changes):
+Run target diagnostics after configuring `config.json`:
+
+```powershell
+python h7tool_mcp.py --probe-h7tool
+python h7tool_mcp.py --health-summary
+python h7tool_mcp.py --target-identity ST/STM32H7xx/STM32H7x_2M.lua
+python h7tool_mcp.py --read-memory 0x1FF1E800 12
+python h7tool_mcp.py --read-option-bytes ST/STM32H7xx/STM32H7x_2M.lua
+python h7tool_mcp.py --protection-status ST/STM32H7xx/STM32H7x_2M.lua
+```
+
+## MCP Configuration
+
+Example:
 
 ```json
 {
   "mcpServers": {
     "h7tool": {
-      "command": "C:\\Users\\zhe\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
-      "args": ["E:\\软件\\绿色软件\\h7toolPC_release\\mcp\\h7tool_mcp.py"]
+      "command": "python",
+      "args": ["C:\\path\\to\\h7tools-mcp\\h7tool_mcp.py"]
     }
   }
 }
 ```
 
-Mock/TCP/UDP modes use only the standard library. USB HID requires `hidapi`,
-which is included in `requirements.txt`.
+Use an absolute path that matches your local checkout.
 
-## Tomorrow's validation sequence
+## Configuration Files
 
-1. Connect the Ethernet cable and set the vendor PC application to
-   Ethernet/WiFi. The validated endpoint is `192.168.3.33:30010` and this PC
-   is `192.168.3.4/24`.
-2. Run `--probe-h7tool`. It sends a V2.33 read-only UDP session poll followed
-   by function-`0x03` reads; it has been verified against this device.
-3. Compare the UID, hardware version, and app version with the vendor screen.
-   The expected current values are UID `003C001E3232511736303936`, hardware
-   `0x0752`, and app `2.33`.
-4. Add the MCP server and call `tool_status` or bounded `tool_registers`.
-   Call `health_summary` for a conservative, AI-friendly assessment of H7-TOOL
-   itself. All three tools are read-only.
+`config.json` is local and should not be committed. Start from one of the example files:
 
-## Configuration
+- `config.usb-hid.example.json`
+- `config.modbus-udp.example.json`
+- `config.modbus-tcp.example.json`
+- `config.usb-lua.example.json`
 
-`config.json` is intentionally not provided because it may contain LAN
-addresses and locally verified command strings; do not commit it to version
-control. The allowed adapter types:
+## MCP Tools
 
-- `mock`: no hardware access; used by default and in self-tests.
-- `modbus_tcp`: standard Modbus TCP read-only access to H7-TOOL. This is the
-  recommended LAN adapter for the first device test.
-- `modbus_udp`: legacy H7-TOOL Modbus RTU-over-UDP transport, default port
-  30010. It uses an unicast frame; the older MAC-prefixed broadcast discovery
-  protocol is intentionally not enabled.
-- `tcp`: opens one configured TCP connection per request and sends a single
-  configured line.
-- `serial`: opens one configured COM port per request and sends a single
-  configured line; requires `pyserial`.
-- `h7tool_hid`: verified current USB transport. It selects only the
-  vendor-defined `H7-TOOL HID Communication` interface and provides only
-  function-`0x03` read access plus the fixed bundled `tool_health.lua`
-  diagnostic runner and fixed bundled STM32H7 target UID probe. It is verified
-  with V2.33 using 1024-byte reports and standard low-byte-first Modbus CRC.
-  Close the vendor PC application before use if it otherwise owns the same HID
-  reports.
+- `bridge_status`
+- `device_vendors`
+- `device_search`
+- `device_profile`
+- `device_capabilities`
+- `tool_status`
+- `health_summary`
+- `lua_health`
+- `target_probe`
+- `target_identity`
+- `tool_registers`
+- `read_option_bytes`
+- `protection_status`
+- `log_tail`
+- `read_memory`
 
-The `commands` values are Python format templates. Only the following
-read-oriented names are accepted by the bridge: `status`, `target_probe`,
-`target_identity`, `read_memory`, `uart_tail`, `rtt_tail`, and `can_tail`.
+## Notes
 
-`read_memory` is capped at 1024 bytes and logs are capped at 200 lines by
-default. With `h7tool_hid`, `read_memory` uses a generated read-only Lua
-template containing only validated numeric address/length values and calls
-`pg_read_mem`; MCP callers cannot provide arbitrary Lua. Changing those limits
-does not permit any write action.
+Device scripts in the H7-TOOL package often describe whole chip families rather than a single exact part number. For example, searching for `STM32H743` may return a generic H7 profile. Use live target data, profile metadata, and chip-specific registers together when exact identification matters.
 
-`read_option_bytes` uses the selected local device profile's parsed
-`OB_ADDRESS` byte list and reads each address with `pg_read_mem(addr, 1)`.
-It intentionally does not call option-byte programming APIs, protection
-changes, erase, reset, power, or arbitrary Lua.
+## Suggested Next Steps
 
-## Health summary
-
-`health_summary` evaluates only H7-TOOL's own TVCC and USB 5V supplies using
-conservative ranges, and reports an NTC value outside -40..125 C as unknown
-(commonly an unconnected sensor), rather than a hardware fault. Target-facing
-measurements such as CH1/CH2 and high-side voltage/current are observations:
-zero may be correct when no target is connected.
-
-The Modbus status decoder reads the legacy V1.49 identity and analog register
-map: device ID `0x0000..0x0005`, model/version and GPIO `0x0006..0x000B`, and
-calibrated measurements `0x000C..0x001F`. It labels the result as compatibility
-data because the connected V2.33 firmware must be checked before relying on
-the field meanings.
-
-## Boundaries and next step
-
-The verified V2.33 UDP transport uses standard low-byte-first Modbus CRC and
-a five-frame `0x61` read-only channel poll before register reads. The device
-adds one zero padding byte to some replies; the bridge strips it based on the
-function-`0x03` byte count.
-
-The verified V2.33 HID Lua flow mirrors the vendor PC "Download" action: send
-one padded 1024-byte HID payload containing function `0x64`, then poll channels
-0..4 with function `0x61` until the fixed script's `H7TOOL_DIAG_END` marker is
-seen. The MCP bridge does not accept caller-provided Lua.
-
-`target_probe` over `h7tool_hid` uses the same fixed-script path with
-`diagnostics/target_probe_stm32h7.lua`. It is read-only and mirrors the manual
-Programmer test for an STM32H7x target: initialize the SWD programmer link,
-read IDCODE when available, and read 12 UID bytes from `0x1FF1E800`.
-
-`target_identity` combines that live read-only probe with local H7-TOOL device
-Lua metadata. By default it reads the bundled
-`EMMC/H7-TOOL/Programmer/Device/ST/STM32H7xx/STM32H7x_2M.lua` profile and
-returns the selected vendor, series, device, expected IDCODE, UID location,
-memory base addresses, and configured FLM algorithm entries. To point it at a
-different local H7-TOOL device script, either pass `relative_path` to
-`target_identity` or set `adapter.target_lua_path` in `config.json`.
-
-The device-library tools (`device_vendors`, `device_search`, `device_profile`,
-and `device_capabilities`) index only local files under
-`EMMC/H7-TOOL/Programmer/Device`; they do not contact hardware. Search skips
-shared `Lib` scripts by default and treats `x` in device-script names as a
-loose wildcard, so a query such as `STM32H743` can find the generic
-`STM32H7x_2M.lua` profile. `device_capabilities` also follows the profile's
-`IncludeList` and reports inferred read-only capabilities separately from
-dangerous write, erase, power, reset, or protection-changing code paths.
+- Improve exact chip-size identification for STM32 families.
+- Generalize target probing so it can be generated from more device profiles.
+- Add friendly summaries for option bytes and protection state.
+- Explore RTT, UART, and CAN assistant features after their public-facing behavior is understood.

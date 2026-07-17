@@ -217,6 +217,18 @@ def parse_lua_target_profile(script_path: Path, text: str) -> dict[str, Any]:
         body = match.group("body")
         return " ".join(re.findall(r"\"([0-9A-Fa-fxX\s]+)\"", body))
 
+    def int_table(name: str) -> list[int]:
+        match = re.search(rf"(?ms)^\s*{name}\s*=\s*\{{(?P<body>.*?)\}}", text)
+        if not match:
+            return []
+        values: list[int] = []
+        for token in re.findall(r"0x[0-9A-Fa-f]+|\d+", match.group("body")):
+            try:
+                values.append(int(token, 0))
+            except ValueError:
+                continue
+        return values
+
     include_list: list[str] = []
     include_match = re.search(r"IncludeList\s*=\s*\{(?P<body>.*?)\}", text, flags=re.S)
     if include_match:
@@ -238,6 +250,17 @@ def parse_lua_target_profile(script_path: Path, text: str) -> dict[str, Any]:
     uid_bytes = int_value("UID_BYTES")
     mcu_id = int_value("MCU_ID")
     ob_address = string_assignment("OB_ADDRESS")
+    wrp_addresses = int_table("OB_WRP_ADDRESS")
+    wrp_masks = int_table("OB_WRP_MASK")
+    wrp_values = int_table("OB_WRP_VALUE")
+    protection_checks = [
+        {
+            "address": _format_hex(address, 8),
+            "mask": _format_hex(wrp_masks[index] if index < len(wrp_masks) else None, 2),
+            "unprotected_value": _format_hex(wrp_values[index] if index < len(wrp_values) else None, 2),
+        }
+        for index, address in enumerate(wrp_addresses)
+    ]
     return {
         "source": str(script_path),
         "relative_path": _relative_device_path(script_path),
@@ -253,6 +276,7 @@ def parse_lua_target_profile(script_path: Path, text: str) -> dict[str, Any]:
         "algorithm_ram_address": _format_hex(int_value("AlgoRamAddr"), 8),
         "algorithm_ram_size_bytes": int_value("AlgoRamSize"),
         "option_byte_addresses": parse_ob_address_string(ob_address) if ob_address else [],
+        "protection_checks": protection_checks,
         "include_list": include_list,
         "algorithm_files": algo_entries,
     }
@@ -1485,6 +1509,65 @@ class H7ToolMcp:
         }
         return result
 
+    def protection_status(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError("protection_status currently requires adapter.type = h7tool_hid")
+        profile = read_selected_target_profile(self.config, arguments)
+        checks = profile.get("protection_checks", [])
+        if not isinstance(checks, list) or not checks:
+            raise BridgeError("Selected device profile does not define protection status checks")
+        addresses: list[int] = []
+        for check in checks:
+            if isinstance(check, dict) and isinstance(check.get("address"), str):
+                addresses.append(int(check["address"], 16))
+        read_result = self.hid_modbus.run_read_option_bytes_script(addresses)
+        entries = read_result["result"]["data"].get("entries", [])
+        values_by_address = {
+            entry["address"].upper(): int(str(entry["value"]), 16)
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("read") == 1 and isinstance(entry.get("value"), str)
+        }
+        decoded: list[dict[str, Any]] = []
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            address = str(check.get("address", "")).upper()
+            mask_text = check.get("mask")
+            expected_text = check.get("unprotected_value")
+            value = values_by_address.get(address)
+            mask = int(mask_text, 16) if isinstance(mask_text, str) else None
+            expected = int(expected_text, 16) if isinstance(expected_text, str) else None
+            unprotected = None
+            if value is not None and mask is not None and expected is not None:
+                unprotected = (value & mask) == expected
+            decoded.append(
+                {
+                    "address": check.get("address"),
+                    "value": _format_hex(value, 2),
+                    "mask": mask_text,
+                    "unprotected_value": expected_text,
+                    "unprotected": unprotected,
+                }
+            )
+        protected_checks = [item for item in decoded if item.get("unprotected") is False]
+        unknown_checks = [item for item in decoded if item.get("unprotected") is None]
+        return {
+            "profile": {
+                "relative_path": profile.get("relative_path"),
+                "vendor": profile.get("vendor"),
+                "series": profile.get("series"),
+                "device": profile.get("device"),
+            },
+            "status": {
+                "overall": "unknown" if unknown_checks else ("protected" if protected_checks else "unprotected"),
+                "protected_count": len(protected_checks),
+                "unknown_count": len(unknown_checks),
+                "check_count": len(decoded),
+            },
+            "checks": decoded,
+            "raw_read": read_result["result"],
+        }
+
     def target_identity(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.adapter.kind != "h7tool_hid":
             raise BridgeError("target_identity currently requires adapter.type = h7tool_hid")
@@ -1566,6 +1649,8 @@ class H7ToolMcp:
             return self.target_identity(arguments)
         if name == "read_option_bytes":
             return self.read_option_bytes(arguments)
+        if name == "protection_status":
+            return self.protection_status(arguments)
         if name == "log_tail":
             source = str(arguments.get("source", ""))
             if source not in {"uart", "rtt", "can"}:
@@ -1698,6 +1783,20 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "read_option_bytes",
         "description": "Read option-byte addresses from the selected local device profile over verified HID Lua pg_read_mem. Read-only; no option-byte programming, protection changes, erase, reset, or power control.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "vendor": {"type": "string"},
+                "series": {"type": "string"},
+                "device": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "protection_status",
+        "description": "Read protection-related profile check addresses and summarize whether the selected target appears protected, unprotected, or unknown.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1858,11 +1957,17 @@ def self_test(_server: H7ToolMcp) -> int:
     profile = parse_lua_target_profile(
         Path("Device/ST/STM32H7xx/STM32H7x_2M.lua"),
         'CHIP_TYPE = "SWD"\nMCU_ID = 0x6BA02477\nUID_ADDR = 0x1FF1E800\nUID_BYTES = 12\n'
-        'FLASH_ADDRESS = 0x08000000\nRAM_ADDRESS = 0x20000000\nAlgoRamSize = 128*1024\n',
+        'FLASH_ADDRESS = 0x08000000\nRAM_ADDRESS = 0x20000000\nAlgoRamSize = 128*1024\n'
+        "OB_WRP_ADDRESS = {0x5200201D, 0x52002038}\nOB_WRP_MASK = {0xFF, 0xFF}\nOB_WRP_VALUE = {0xAA, 0xFF}\n",
     )
     assert profile["expected_idcode"] == "0x6BA02477"
     assert profile["uid_address"] == "0x1FF1E800"
     assert profile["algorithm_ram_size_bytes"] == 128 * 1024
+    assert profile["protection_checks"][0] == {
+        "address": "0x5200201D",
+        "mask": "0xFF",
+        "unprotected_value": "0xAA",
+    }
     assert parse_ob_address_string("52002020 52002021") == ["0x52002020", "0x52002021"]
     vendors = device_vendors()
     assert vendors["total_lua"] > 1000
@@ -1916,6 +2021,7 @@ def main() -> int:
     parser.add_argument("--target-probe", action="store_true", help="Run the configured read-only target probe and print JSON")
     parser.add_argument("--target-identity", nargs="?", const="", metavar="RELATIVE_PATH", help="Run the read-only target identity profile; optionally select a local device Lua relative path")
     parser.add_argument("--read-option-bytes", nargs="?", const="", metavar="RELATIVE_PATH", help="Read option bytes using a selected local device Lua profile")
+    parser.add_argument("--protection-status", nargs="?", const="", metavar="RELATIVE_PATH", help="Read and summarize protection status using a selected local device Lua profile")
     parser.add_argument("--read-memory", nargs=2, metavar=("ADDRESS", "LENGTH"), help="Read a bounded target memory range through the configured adapter")
     parser.add_argument("--tool-registers", nargs=2, metavar=("ADDRESS", "COUNT"), help="Read bounded H7-TOOL holding registers through the configured Modbus adapter")
     args = parser.parse_args()
@@ -1987,6 +2093,14 @@ def main() -> int:
         try:
             ob_args = {"relative_path": args.read_option_bytes} if args.read_option_bytes else {}
             print(json.dumps(server.call_tool("read_option_bytes", ob_args), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.protection_status is not None:
+        try:
+            protection_args = {"relative_path": args.protection_status} if args.protection_status else {}
+            print(json.dumps(server.call_tool("protection_status", protection_args), ensure_ascii=False, indent=2))
             return 0
         except BridgeError as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
