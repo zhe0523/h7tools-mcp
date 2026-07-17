@@ -174,6 +174,9 @@ def parse_uart_transact_output(raw: bytes) -> dict[str, Any]:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip()
+        key_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)$", key)
+        if key_match:
+            key = key_match.group(1)
         if key in {"configured", "channel", "baudrate", "parity", "data_bits", "stop_bits", "tx_len", "rx_len"}:
             data[key] = _parse_lua_number(value)
         elif key == "rx_hex":
