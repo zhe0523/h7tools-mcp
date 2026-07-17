@@ -228,6 +228,47 @@ def parse_can_transact_output(raw: bytes) -> dict[str, Any]:
     return {"raw": text, "format": "h7tool_can_transact", "data": data}
 
 
+def parse_i2c_transact_output(raw: bytes) -> dict[str, Any]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    data: dict[str, Any] = {}
+    found: list[str] = []
+    ack_values: list[int | str] = []
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        key_match = re.search(r"([A-Za-z_][A-Za-z0-9_\[\]]*)$", key)
+        if key_match:
+            key = key_match.group(1)
+        if key in {"initialized", "clock_hz", "address", "write_len", "read_len", "scan_count"}:
+            data[key] = _parse_lua_number(value)
+        elif key == "found":
+            found.append(value.upper().replace("X", "x") if value.lower().startswith("0x") else value)
+        elif key == "rx_hex":
+            parts = [part.upper() for part in value.split() if part]
+            data["rx_hex"] = " ".join(parts)
+            data["rx_bytes"] = parts
+            data["rx_text"] = bytes.fromhex("".join(parts)).decode("utf-8", errors="replace") if parts else ""
+        else:
+            match = re.fullmatch(r"ack\[(\d+)\]", key)
+            if match:
+                ack_values.append(_parse_lua_number(value))
+            else:
+                data[key] = value
+    if found:
+        data["found_addresses"] = found
+    if ack_values:
+        data["acks"] = ack_values
+    if data.get("read_len") == 0:
+        data.setdefault("rx_hex", "")
+        data.setdefault("rx_bytes", [])
+        data.setdefault("rx_text", "")
+    data["ok"] = data.get("initialized") == 1 and (True if "scan_count" in data else all(value == 0 for value in ack_values))
+    return {"raw": text, "format": "h7tool_i2c_transact", "data": data}
+
+
 def parse_rtt_read_output(raw: bytes) -> dict[str, Any]:
     text = raw.decode("utf-8", errors="replace").strip()
     data: dict[str, Any] = {}
@@ -1829,6 +1870,74 @@ print("H7TOOL_CAN_END")
         result["result"] = parse_can_transact_output(result["result"]["raw"].encode("utf-8", errors="replace"))
         return result
 
+    def run_i2c_transact_script(
+        self,
+        clock_hz: int,
+        scan: bool,
+        address: int,
+        write_data: bytes,
+        read_length: int,
+    ) -> dict[str, Any]:
+        write_literal = lua_string_literal(write_data)
+        if scan:
+            script = f"""print("H7TOOL_I2C_BEGIN")
+local CLK={clock_hz}
+i2c_bus("init",CLK)
+print("initialized=1")
+print("clock_hz="..CLK)
+local c=0
+for a=1,127,1 do
+ i2c_bus("start")
+ local ack=i2c_bus("send",a*2)
+ i2c_bus("stop")
+ if ack==0 then print(string.format("found=0x%02X",a));c=c+1 end
+end
+print("scan_count="..c)
+print("H7TOOL_I2C_END")
+""".encode("ascii")
+            result = self._run_lua_script(script, "generated/i2c_scan.lua", b"H7TOOL_I2C_BEGIN", b"H7TOOL_I2C_END")
+            result["result"] = parse_i2c_transact_output(result["result"]["raw"].encode("utf-8", errors="replace"))
+            return result
+        script = f"""print("H7TOOL_I2C_BEGIN")
+local CLK={clock_hz}
+local ADDR=0x{address:02X}
+local TX={write_literal}
+local RL={read_length}
+local function hx(b)
+ local r=""
+ for i=1,string.len(b),1 do r=r..string.format("%02X",string.byte(b,i));if i<string.len(b) then r=r.." " end end
+ return r
+end
+i2c_bus("init",CLK)
+print("initialized=1")
+print("clock_hz="..CLK)
+print(string.format("address=0x%02X",ADDR))
+print("write_len="..string.len(TX))
+i2c_bus("start")
+local ack=i2c_bus("send",ADDR*2)
+print("ack[0]="..ack)
+for i=1,string.len(TX),1 do
+ ack=i2c_bus("send",string.byte(TX,i))
+ print(string.format("ack[%d]=%s",i,ack))
+end
+if RL>0 then
+ i2c_bus("start")
+ ack=i2c_bus("send",ADDR*2+1)
+ print(string.format("ack[%d]=%s",string.len(TX)+1,ack))
+ local rx=i2c_bus("recive",RL)
+ if rx==nil then rx="" end
+ print("read_len="..string.len(rx))
+ print("rx_hex="..hx(rx))
+else
+ print("read_len=0")
+end
+i2c_bus("stop")
+print("H7TOOL_I2C_END")
+""".encode("ascii")
+        result = self._run_lua_script(script, "generated/i2c_transact.lua", b"H7TOOL_I2C_BEGIN", b"H7TOOL_I2C_END")
+        result["result"] = parse_i2c_transact_output(result["result"]["raw"].encode("utf-8", errors="replace"))
+        return result
+
     def run_rtt_read_script(
         self,
         control_block_address: int | None,
@@ -2134,6 +2243,43 @@ class H7ToolMcp:
             interval_ms=interval_ms,
         )
 
+    def i2c_transact(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        clock_hz = int(arguments.get("clock_hz", 100000))
+        scan = bool(arguments.get("scan", False))
+        address_text = arguments.get("address", "0x50")
+        if isinstance(address_text, str):
+            address = int(address_text, 0)
+        else:
+            address = int(address_text)
+        read_length = int(arguments.get("read_length", 0))
+        if not 1000 <= clock_hz <= 1000000:
+            raise BridgeError("clock_hz must be between 1000 and 1000000")
+        if not 0 <= address <= 0x7F:
+            raise BridgeError("address must be a 7-bit I2C address, 0..0x7F")
+        if not 0 <= read_length <= 256:
+            raise BridgeError("read_length must be between 0 and 256")
+        write_text = arguments.get("write_text")
+        write_hex = arguments.get("write_hex")
+        if isinstance(write_text, str) and isinstance(write_hex, str) and write_text and write_hex:
+            raise BridgeError("Provide only one of write_text or write_hex")
+        if isinstance(write_hex, str) and write_hex:
+            write_data = parse_hex_bytes(write_hex)
+        elif isinstance(write_text, str) and write_text:
+            write_data = write_text.encode("utf-8")
+        else:
+            write_data = b""
+        if len(write_data) > 256:
+            raise BridgeError("I2C write payload is limited to 256 bytes")
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError("i2c_transact currently requires adapter.type = h7tool_hid")
+        return self.hid_modbus.run_i2c_transact_script(
+            clock_hz=clock_hz,
+            scan=scan,
+            address=address,
+            write_data=write_data,
+            read_length=read_length,
+        )
+
     def rtt_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
         channel = int(arguments.get("channel", 0))
         max_bytes = int(arguments.get("max_bytes", 512))
@@ -2414,6 +2560,8 @@ class H7ToolMcp:
             return self.uart_transact(arguments)
         if name == "can_transact":
             return self.can_transact(arguments)
+        if name == "i2c_transact":
+            return self.i2c_transact(arguments)
         if name == "rtt_read":
             return self.rtt_read(arguments)
         if name == "read_option_bytes":
@@ -2682,6 +2830,22 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "i2c_transact",
+        "description": "Initialize H7-TOOL I2C, scan 7-bit addresses or perform a bounded write/read transaction.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "clock_hz": {"type": "integer", "minimum": 1000, "maximum": 1000000, "default": 100000},
+                "scan": {"type": "boolean", "default": False},
+                "address": {"type": "string", "pattern": "^0x[0-9A-Fa-f]+$", "default": "0x50"},
+                "write_hex": {"type": "string", "description": "Hex bytes to write after the address write phase."},
+                "write_text": {"type": "string", "description": "UTF-8 bytes to write after the address write phase."},
+                "read_length": {"type": "integer", "minimum": 0, "maximum": 256, "default": 0},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "log_tail",
         "description": "Read a bounded UART, RTT, or CAN log window through a configured command.",
         "inputSchema": {
@@ -2913,6 +3077,17 @@ def self_test(_server: H7ToolMcp) -> int:
         pass
     else:
         raise AssertionError("CAN data_text/data_hex exclusivity was not enforced")
+    i2c = parse_i2c_transact_output(
+        b"H7TOOL_I2C_BEGIN\ninitialized=1\nclock_hz=100000\naddress=0x50\nwrite_len=1\nack[0]=0\nack[1]=0\nread_len=2\nrx_hex=12 34\nH7TOOL_I2C_END\n"
+    )
+    assert i2c["data"]["ok"] is True
+    assert i2c["data"]["rx_bytes"] == ["12", "34"]
+    try:
+        server.call_tool("i2c_transact", {"write_text": "a", "write_hex": "61"})
+    except BridgeError:
+        pass
+    else:
+        raise AssertionError("I2C write_text/write_hex exclusivity was not enforced")
     rtt = parse_rtt_read_output(
         b"H7TOOL_RTT_BEGIN\nfound=1\ncontrol_block=0x20000000\nchannel=0\nmax_up_buffers=1\n"
         b"buffer_address=0x20001000\nbuffer_size=1024\nwrite_offset=5\nread_offset=0\navailable=5\nread_len=5\n"
@@ -3073,6 +3248,13 @@ def main() -> int:
     parser.add_argument("--can-data-text", help="UTF-8 text payload for --can-transact")
     parser.add_argument("--can-count", type=int, default=1, help="Number of CAN frames to transmit")
     parser.add_argument("--can-interval-ms", type=int, default=0, help="Delay between repeated CAN frames")
+    parser.add_argument("--i2c-transact", action="store_true", help="Scan I2C or perform one bounded I2C write/read transaction")
+    parser.add_argument("--i2c-clock", type=int, default=100000, help="I2C clock in Hz")
+    parser.add_argument("--i2c-scan", action="store_true", help="Scan 7-bit I2C addresses")
+    parser.add_argument("--i2c-address", default="0x50", help="7-bit I2C address")
+    parser.add_argument("--i2c-write-hex", help="Hex bytes to write")
+    parser.add_argument("--i2c-write-text", help="UTF-8 bytes to write")
+    parser.add_argument("--i2c-read-length", type=int, default=0, help="Number of I2C bytes to read")
     args = parser.parse_args()
     if args.list_serial_ports:
         print(json.dumps(list_windows_serial_ports(), ensure_ascii=False, indent=2))
@@ -3247,6 +3429,23 @@ def main() -> int:
             if args.can_data_text is not None:
                 can_args["data_text"] = args.can_data_text
             print(json.dumps(server.call_tool("can_transact", can_args), ensure_ascii=False, indent=2))
+            return 0
+        except (BridgeError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.i2c_transact:
+        try:
+            i2c_args = {
+                "clock_hz": args.i2c_clock,
+                "scan": args.i2c_scan,
+                "address": args.i2c_address,
+                "read_length": args.i2c_read_length,
+            }
+            if args.i2c_write_hex is not None:
+                i2c_args["write_hex"] = args.i2c_write_hex
+            if args.i2c_write_text is not None:
+                i2c_args["write_text"] = args.i2c_write_text
+            print(json.dumps(server.call_tool("i2c_transact", i2c_args), ensure_ascii=False, indent=2))
             return 0
         except (BridgeError, ValueError) as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)

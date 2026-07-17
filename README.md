@@ -196,6 +196,7 @@ Good workflow:
 - `protection_status`
 - `uart_transact`
 - `can_transact`
+- `i2c_transact`
 - `rtt_read`
 - `log_tail`
 - `read_memory`
