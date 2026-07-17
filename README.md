@@ -118,7 +118,7 @@ control. The allowed adapter types:
 
 The `commands` values are Python format templates. Only the following
 read-oriented names are accepted by the bridge: `status`, `target_probe`,
-`read_memory`, `uart_tail`, `rtt_tail`, and `can_tail`.
+`target_identity`, `read_memory`, `uart_tail`, `rtt_tail`, and `can_tail`.
 
 `read_memory` is capped at 1024 bytes and logs are capped at 200 lines by
 default. Changing those limits does not permit any write action.
@@ -153,3 +153,11 @@ seen. The MCP bridge does not accept caller-provided Lua.
 `diagnostics/target_probe_stm32h7.lua`. It is read-only and mirrors the manual
 Programmer test for an STM32H7x target: initialize the SWD programmer link,
 read IDCODE when available, and read 12 UID bytes from `0x1FF1E800`.
+
+`target_identity` combines that live read-only probe with local H7-TOOL device
+Lua metadata. By default it reads the bundled
+`EMMC/H7-TOOL/Programmer/Device/ST/STM32H7xx/STM32H7x_2M.lua` profile and
+returns the selected vendor, series, device, expected IDCODE, UID location,
+memory base addresses, and configured FLM algorithm entries. To point it at a
+different local H7-TOOL device script, set `adapter.target_lua_path` in
+`config.json`.

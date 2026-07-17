@@ -9,9 +9,11 @@ verified against vendor documentation or a controlled manual test.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -26,6 +28,7 @@ SERVER_NAME = "h7tool-readonly-diagnostics"
 SERVER_VERSION = "0.3.0"
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
+DEFAULT_TARGET_LUA = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL" / "Programmer" / "Device" / "ST" / "STM32H7xx" / "STM32H7x_2M.lua"
 
 
 class BridgeError(Exception):
@@ -96,6 +99,98 @@ def parse_target_probe_output(raw: bytes) -> dict[str, Any]:
             connected = True
     data["connected"] = connected
     return {"raw": text, "format": "h7tool_target_probe", "data": data}
+
+
+def _safe_int_expr(expr: str) -> int | None:
+    """Evaluate the small integer expressions used in H7-TOOL Lua metadata."""
+    try:
+        node = ast.parse(expr.strip(), mode="eval").body
+    except SyntaxError:
+        return None
+
+    def walk(item: ast.AST) -> int:
+        if isinstance(item, ast.Constant) and isinstance(item.value, int):
+            return item.value
+        if isinstance(item, ast.UnaryOp) and isinstance(item.op, ast.USub):
+            return -walk(item.operand)
+        if isinstance(item, ast.BinOp) and isinstance(item.op, (ast.Add, ast.Sub, ast.Mult)):
+            left = walk(item.left)
+            right = walk(item.right)
+            if isinstance(item.op, ast.Add):
+                return left + right
+            if isinstance(item.op, ast.Sub):
+                return left - right
+            return left * right
+        raise ValueError("unsupported expression")
+
+    try:
+        return walk(node)
+    except ValueError:
+        return None
+
+
+def parse_lua_target_profile(script_path: Path, text: str) -> dict[str, Any]:
+    def string_value(name: str) -> str | None:
+        match = re.search(rf"(?m)^\s*{name}\s*=\s*\"([^\"]*)\"", text)
+        return match.group(1) if match else None
+
+    def int_value(name: str) -> int | None:
+        match = re.search(rf"(?m)^\s*{name}\s*=\s*([^\r\n-]+)", text)
+        return _safe_int_expr(match.group(1).strip()) if match else None
+
+    include_list: list[str] = []
+    include_match = re.search(r"IncludeList\s*=\s*\{(?P<body>.*?)\}", text, flags=re.S)
+    if include_match:
+        include_list = re.findall(r"\"(0:/H7-TOOL/Programmer/Device/[^\"]+)\"", include_match.group("body"))
+    algo_entries: list[dict[str, Any]] = []
+    algo_list = re.search(r"AlgoFile_List\s*=\s*\{(?P<body>.*?)\}", text, flags=re.S)
+    if algo_list:
+        for match in re.finditer(r"\"([A-Za-z0-9_]+)\"\s*,\s*([^,\n]+)\s*,\s*([^,\n]+)", algo_list.group("body")):
+            variable, address_expr, size_expr = match.groups()
+            algo_entries.append(
+                {
+                    "variable": variable,
+                    "file": string_value(variable),
+                    "address": _format_hex(_safe_int_expr(address_expr), 8),
+                    "size_bytes": _safe_int_expr(size_expr),
+                }
+            )
+    uid_addr = int_value("UID_ADDR")
+    uid_bytes = int_value("UID_BYTES")
+    mcu_id = int_value("MCU_ID")
+    return {
+        "source": str(script_path),
+        "vendor": script_path.parts[-3] if len(script_path.parts) >= 3 else None,
+        "series": script_path.parent.name,
+        "device": script_path.stem,
+        "chip_type": string_value("CHIP_TYPE"),
+        "expected_idcode": _format_hex(mcu_id, 8),
+        "uid_address": _format_hex(uid_addr, 8),
+        "uid_length": uid_bytes,
+        "flash_address": _format_hex(int_value("FLASH_ADDRESS"), 8),
+        "ram_address": _format_hex(int_value("RAM_ADDRESS"), 8),
+        "algorithm_ram_address": _format_hex(int_value("AlgoRamAddr"), 8),
+        "algorithm_ram_size_bytes": int_value("AlgoRamSize"),
+        "include_list": include_list,
+        "algorithm_files": algo_entries,
+    }
+
+
+def _format_hex(value: int | None, width: int = 0) -> str | None:
+    if value is None:
+        return None
+    return f"0x{value:0{width}X}" if width else f"0x{value:X}"
+
+
+def read_target_profile(config: dict[str, Any]) -> dict[str, Any]:
+    adapter_config = config.get("adapter", {})
+    configured_path = adapter_config.get("target_lua_path") if isinstance(adapter_config, dict) else None
+    script_path = Path(configured_path) if isinstance(configured_path, str) and configured_path else DEFAULT_TARGET_LUA
+    try:
+        text = script_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise BridgeError(f"Cannot read target Lua profile {script_path}: {exc}") from exc
+    return parse_lua_target_profile(script_path, text)
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -938,6 +1033,41 @@ class H7ToolMcp:
     def read_hid_target_probe(self) -> dict[str, Any]:
         return self.hid_modbus.run_target_probe_script()
 
+    def target_identity(self) -> dict[str, Any]:
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError("target_identity currently requires adapter.type = h7tool_hid")
+        profile = read_target_profile(self.config)
+        probe = self.read_hid_target_probe()
+        probe_data = probe["result"]["data"]
+        expected_idcode = profile.get("expected_idcode")
+        actual_idcode = probe_data.get("idcode")
+        return {
+            "transport": probe["transport"],
+            "script": probe["script"],
+            "profile": profile,
+            "probe": probe["result"],
+            "identity": {
+                "connected": bool(probe_data.get("connected")),
+                "interface": profile.get("chip_type"),
+                "vendor": profile.get("vendor"),
+                "series": profile.get("series"),
+                "device": profile.get("device"),
+                "idcode": actual_idcode,
+                "expected_idcode": expected_idcode,
+                "idcode_match": bool(
+                    isinstance(actual_idcode, str)
+                    and isinstance(expected_idcode, str)
+                    and actual_idcode.upper() == expected_idcode.upper()
+                ),
+                "uid_address": probe_data.get("uid_address") or profile.get("uid_address"),
+                "uid_length": probe_data.get("uid_length") or profile.get("uid_length"),
+                "uid_hex": probe_data.get("uid_hex"),
+                "uid_bytes": probe_data.get("uid_bytes"),
+                "flash_address": profile.get("flash_address"),
+                "ram_address": profile.get("ram_address"),
+            },
+        }
+
     def health_summary(self) -> dict[str, Any]:
         if self.adapter.kind not in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
             raise BridgeError("health_summary requires adapter.type = modbus_tcp, modbus_udp, or h7tool_hid")
@@ -967,6 +1097,8 @@ class H7ToolMcp:
             if self.adapter.kind == "h7tool_hid":
                 return self.read_hid_target_probe()
             return self.run_configured_command("target_probe", arguments)
+        if name == "target_identity":
+            return self.target_identity()
         if name == "log_tail":
             source = str(arguments.get("source", ""))
             if source not in {"uart", "rtt", "can"}:
@@ -1012,6 +1144,11 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "target_probe",
         "description": "Run a read-only target probe. With adapter.type=h7tool_hid, executes only the bundled STM32H7 UID probe script over HID.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "target_identity",
+        "description": "Build a read-only target identity profile by combining the selected local H7-TOOL device Lua metadata with the verified HID STM32H7 UID probe.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -1163,6 +1300,14 @@ def self_test(_server: H7ToolMcp) -> int:
     )
     assert target["data"]["connected"] is True
     assert target["data"]["uid_bytes"] == ["3C", "00", "1E", "00"]
+    profile = parse_lua_target_profile(
+        Path("Device/ST/STM32H7xx/STM32H7x_2M.lua"),
+        'CHIP_TYPE = "SWD"\nMCU_ID = 0x6BA02477\nUID_ADDR = 0x1FF1E800\nUID_BYTES = 12\n'
+        'FLASH_ADDRESS = 0x08000000\nRAM_ADDRESS = 0x20000000\nAlgoRamSize = 128*1024\n',
+    )
+    assert profile["expected_idcode"] == "0x6BA02477"
+    assert profile["uid_address"] == "0x1FF1E800"
+    assert profile["algorithm_ram_size_bytes"] == 128 * 1024
     try:
         server.call_tool("read_memory", {"address": "0x20000000", "length": 4096})
     except BridgeError:
@@ -1189,6 +1334,7 @@ def main() -> int:
     parser.add_argument("--health-summary", action="store_true", help="Run the configured conservative read-only health assessment and print JSON")
     parser.add_argument("--lua-health", action="store_true", help="Run the bundled read-only Lua health script through the configured HID adapter")
     parser.add_argument("--target-probe", action="store_true", help="Run the configured read-only target probe and print JSON")
+    parser.add_argument("--target-identity", action="store_true", help="Run the read-only target identity profile and print JSON")
     parser.add_argument("--tool-registers", nargs=2, metavar=("ADDRESS", "COUNT"), help="Read bounded H7-TOOL holding registers through the configured Modbus adapter")
     args = parser.parse_args()
     if args.list_serial_ports:
@@ -1225,6 +1371,13 @@ def main() -> int:
     if args.target_probe:
         try:
             print(json.dumps(server.call_tool("target_probe", {}), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.target_identity:
+        try:
+            print(json.dumps(server.call_tool("target_identity", {}), ensure_ascii=False, indent=2))
             return 0
         except BridgeError as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
