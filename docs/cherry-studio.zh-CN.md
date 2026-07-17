@@ -106,7 +106,8 @@ python h7tool_mcp.py --target-summary ST/STM32H7xx/STM32H7x_2M.lua --include-pro
 
 - `命令` 只填可执行程序，例如 `py` 或 `python`。
 - `参数` 填后面的参数。如果使用 `py -3.12`，参数就是 `-3.12 D:\Tools\h7toolPC_release\mcp\h7tool_mcp.py`。
-- 路径要换成你本机真实的 `h7tool_mcp.py` 绝对路径。
+- `D:\Tools\h7toolPC_release\mcp\h7tool_mcp.py` 只是示例路径，必须换成你本机真实的 `h7tool_mcp.py` 绝对路径。
+- `py` 和 `python` 不能混用参数：如果命令填 `py`，参数可以带 `-3.12`；如果命令填 `python`，参数里不要写 `-3.12`。
 - 如果路径里有空格，优先把仓库放到无空格路径；如果必须使用带空格路径，按 Cherry Studio 当前输入框规则给脚本路径加引号。
 
 保存后，如果工具没有出现，可以重启 Cherry Studio 再试。
@@ -143,6 +144,42 @@ python h7tool_mcp.py --target-summary ST/STM32H7xx/STM32H7x_2M.lua --include-pro
 - 确认命令和参数分开填写。
 - 确认脚本路径是绝对路径。
 - 保存后重启 Cherry Studio。
+
+### 启用时报 `Connection closed`
+
+通常是 MCP 进程刚启动就退出了。优先检查这两项：
+
+1. 如果命令填的是 `python`，参数不要写 `-3.12`。
+
+错误示例：
+
+```text
+命令: python
+参数: -3.12 D:\Tools\h7toolPC_release\mcp\h7tool_mcp.py
+```
+
+正确示例一：
+
+```text
+命令: py
+参数: -3.12 D:\Tools\h7toolPC_release\mcp\h7tool_mcp.py
+```
+
+正确示例二：
+
+```text
+命令: python
+参数: D:\Tools\h7toolPC_release\mcp\h7tool_mcp.py
+```
+
+2. 确认脚本路径真实存在。可以在 PowerShell 里测试：
+
+```powershell
+Test-Path D:\Tools\h7toolPC_release\mcp\h7tool_mcp.py
+py -3.12 D:\Tools\h7toolPC_release\mcp\h7tool_mcp.py --self-test
+```
+
+如果 `--self-test` 能输出 `Self-test passed`，说明 Cherry Studio 里也应该使用同一组命令和参数。
 
 ### 提示找不到 hid 或 serial
 
