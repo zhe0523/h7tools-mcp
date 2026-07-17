@@ -269,6 +269,42 @@ def parse_i2c_transact_output(raw: bytes) -> dict[str, Any]:
     return {"raw": text, "format": "h7tool_i2c_transact", "data": data}
 
 
+def parse_spi_transact_output(raw: bytes) -> dict[str, Any]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    data: dict[str, Any] = {}
+    errors: list[str] = []
+    for line in text.splitlines():
+        stripped_line = line.strip()
+        if "parameter error" in stripped_line.lower() or stripped_line.lower().startswith("error :"):
+            errors.append(stripped_line)
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        key_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)$", key)
+        if key_match:
+            key = key_match.group(1)
+        if key in {"initialized", "freq_id", "phase", "polarity", "cs", "write_len", "read_len", "delay_us"}:
+            data[key] = _parse_lua_number(value)
+        elif key in {"tx_hex", "rx_hex"}:
+            parts = [part.upper() for part in value.split() if part]
+            data[key] = " ".join(parts)
+            data[key.replace("_hex", "_bytes")] = parts
+            if key == "rx_hex":
+                data["rx_text"] = bytes.fromhex("".join(parts)).decode("utf-8", errors="replace") if parts else ""
+        else:
+            data[key] = value
+    if errors:
+        data["errors"] = errors
+    if data.get("read_len") == 0:
+        data.setdefault("rx_hex", "")
+        data.setdefault("rx_bytes", [])
+        data.setdefault("rx_text", "")
+    data["ok"] = not errors and data.get("initialized") == 1 and isinstance(data.get("read_len"), int)
+    return {"raw": text, "format": "h7tool_spi_transact", "data": data}
+
+
 def parse_rtt_read_output(raw: bytes) -> dict[str, Any]:
     text = raw.decode("utf-8", errors="replace").strip()
     data: dict[str, Any] = {}
@@ -1938,6 +1974,58 @@ print("H7TOOL_I2C_END")
         result["result"] = parse_i2c_transact_output(result["result"]["raw"].encode("utf-8", errors="replace"))
         return result
 
+    def run_spi_transact_script(
+        self,
+        freq_id: int,
+        phase: int,
+        polarity: int,
+        cs: int,
+        write_data: bytes,
+        read_length: int,
+        delay_us: int,
+    ) -> dict[str, Any]:
+        write_literal = lua_string_literal(write_data)
+        tx_hex = " ".join(f"{byte:02X}" for byte in write_data)
+        script = f"""print("H7TOOL_SPI_BEGIN")
+local F={freq_id}
+local PH={phase}
+local PO={polarity}
+local CS={cs}
+local TX={write_literal}
+local RL={read_length}
+local D={delay_us}
+local function hx(b)
+ local r=""
+ for i=1,string.len(b),1 do r=r..string.format("%02X",string.byte(b,i));if i<string.len(b) then r=r.." " end end
+ return r
+end
+gpio_cfg(0,1)
+gpio_cfg(1,1)
+gpio_write(0,1)
+gpio_write(1,1)
+spi_bus("init",F,PH,PO)
+print("initialized=1")
+print("freq_id="..F)
+print("phase="..PH)
+print("polarity="..PO)
+print("cs="..CS)
+print("write_len="..string.len(TX))
+print("tx_hex={tx_hex}")
+if CS==0 or CS==1 then gpio_write(CS,0) end
+if string.len(TX)>0 then spi_bus("send",TX) end
+if D>0 then delayus(D) end
+local rx=""
+if RL>0 then rx=spi_bus("recive",RL);if rx==nil then rx="" end end
+if CS==0 or CS==1 then gpio_write(CS,1) end
+print("read_len="..string.len(rx))
+print("rx_hex="..hx(rx))
+print("delay_us="..D)
+print("H7TOOL_SPI_END")
+""".encode("ascii")
+        result = self._run_lua_script(script, "generated/spi_transact.lua", b"H7TOOL_SPI_BEGIN", b"H7TOOL_SPI_END")
+        result["result"] = parse_spi_transact_output(result["result"]["raw"].encode("utf-8", errors="replace"))
+        return result
+
     def run_rtt_read_script(
         self,
         control_block_address: int | None,
@@ -2280,6 +2368,49 @@ class H7ToolMcp:
             read_length=read_length,
         )
 
+    def spi_transact(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        freq_id = int(arguments.get("freq_id", 0))
+        phase = int(arguments.get("phase", 0))
+        polarity = int(arguments.get("polarity", 0))
+        cs = int(arguments.get("cs", 0))
+        read_length = int(arguments.get("read_length", 0))
+        delay_us = int(arguments.get("delay_us", 0))
+        if not 0 <= freq_id <= 7:
+            raise BridgeError("freq_id must be between 0 and 7")
+        if phase not in {0, 1}:
+            raise BridgeError("phase must be 0 or 1")
+        if polarity not in {0, 1}:
+            raise BridgeError("polarity must be 0 or 1")
+        if cs not in {0, 1}:
+            raise BridgeError("cs must be 0 or 1")
+        if not 0 <= read_length <= 256:
+            raise BridgeError("read_length must be between 0 and 256")
+        if not 0 <= delay_us <= 1000000:
+            raise BridgeError("delay_us must be between 0 and 1000000")
+        write_text = arguments.get("write_text")
+        write_hex = arguments.get("write_hex")
+        if isinstance(write_text, str) and isinstance(write_hex, str) and write_text and write_hex:
+            raise BridgeError("Provide only one of write_text or write_hex")
+        if isinstance(write_hex, str) and write_hex:
+            write_data = parse_hex_bytes(write_hex)
+        elif isinstance(write_text, str) and write_text:
+            write_data = write_text.encode("utf-8")
+        else:
+            write_data = b""
+        if len(write_data) > 256:
+            raise BridgeError("SPI write payload is limited to 256 bytes")
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError("spi_transact currently requires adapter.type = h7tool_hid")
+        return self.hid_modbus.run_spi_transact_script(
+            freq_id=freq_id,
+            phase=phase,
+            polarity=polarity,
+            cs=cs,
+            write_data=write_data,
+            read_length=read_length,
+            delay_us=delay_us,
+        )
+
     def rtt_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
         channel = int(arguments.get("channel", 0))
         max_bytes = int(arguments.get("max_bytes", 512))
@@ -2562,6 +2693,8 @@ class H7ToolMcp:
             return self.can_transact(arguments)
         if name == "i2c_transact":
             return self.i2c_transact(arguments)
+        if name == "spi_transact":
+            return self.spi_transact(arguments)
         if name == "rtt_read":
             return self.rtt_read(arguments)
         if name == "read_option_bytes":
@@ -2846,6 +2979,24 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "spi_transact",
+        "description": "Initialize H7-TOOL SPI and perform one bounded CS-selected write/read transaction.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "freq_id": {"type": "integer", "minimum": 0, "maximum": 7, "default": 0, "description": "SPI speed index, 0..7 from low to high."},
+                "phase": {"type": "integer", "enum": [0, 1], "default": 0},
+                "polarity": {"type": "integer", "enum": [0, 1], "default": 0},
+                "cs": {"type": "integer", "enum": [0, 1], "default": 0, "description": "H7-TOOL chip-select line: 0 for CS0, 1 for CS1."},
+                "write_hex": {"type": "string", "description": "Hex bytes to write while CS is asserted."},
+                "write_text": {"type": "string", "description": "UTF-8 bytes to write while CS is asserted."},
+                "read_length": {"type": "integer", "minimum": 0, "maximum": 256, "default": 0},
+                "delay_us": {"type": "integer", "minimum": 0, "maximum": 1000000, "default": 0, "description": "Delay between write and read, in microseconds."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "log_tail",
         "description": "Read a bounded UART, RTT, or CAN log window through a configured command.",
         "inputSchema": {
@@ -3088,6 +3239,17 @@ def self_test(_server: H7ToolMcp) -> int:
         pass
     else:
         raise AssertionError("I2C write_text/write_hex exclusivity was not enforced")
+    spi = parse_spi_transact_output(
+        b"H7TOOL_SPI_BEGIN\ninitialized=1\nfreq_id=0\nphase=0\npolarity=0\ncs=0\nwrite_len=1\ntx_hex=9F\nread_len=3\nrx_hex=AA BB CC\ndelay_us=0\nH7TOOL_SPI_END\n"
+    )
+    assert spi["data"]["ok"] is True
+    assert spi["data"]["rx_bytes"] == ["AA", "BB", "CC"]
+    try:
+        server.call_tool("spi_transact", {"write_text": "a", "write_hex": "61"})
+    except BridgeError:
+        pass
+    else:
+        raise AssertionError("SPI write_text/write_hex exclusivity was not enforced")
     rtt = parse_rtt_read_output(
         b"H7TOOL_RTT_BEGIN\nfound=1\ncontrol_block=0x20000000\nchannel=0\nmax_up_buffers=1\n"
         b"buffer_address=0x20001000\nbuffer_size=1024\nwrite_offset=5\nread_offset=0\navailable=5\nread_len=5\n"
@@ -3255,6 +3417,15 @@ def main() -> int:
     parser.add_argument("--i2c-write-hex", help="Hex bytes to write")
     parser.add_argument("--i2c-write-text", help="UTF-8 bytes to write")
     parser.add_argument("--i2c-read-length", type=int, default=0, help="Number of I2C bytes to read")
+    parser.add_argument("--spi-transact", action="store_true", help="Perform one bounded H7-TOOL SPI write/read transaction")
+    parser.add_argument("--spi-freq-id", type=int, default=0, choices=range(0, 8), metavar="0..7", help="SPI speed index, 0..7 from low to high")
+    parser.add_argument("--spi-phase", type=int, default=0, choices=[0, 1], help="SPI clock phase")
+    parser.add_argument("--spi-polarity", type=int, default=0, choices=[0, 1], help="SPI clock polarity")
+    parser.add_argument("--spi-cs", type=int, default=0, choices=[0, 1], help="SPI chip-select line: 0 for CS0, 1 for CS1")
+    parser.add_argument("--spi-write-hex", help="Hex bytes to write")
+    parser.add_argument("--spi-write-text", help="UTF-8 bytes to write")
+    parser.add_argument("--spi-read-length", type=int, default=0, help="Number of SPI bytes to read")
+    parser.add_argument("--spi-delay-us", type=int, default=0, help="Delay between SPI write and read in microseconds")
     args = parser.parse_args()
     if args.list_serial_ports:
         print(json.dumps(list_windows_serial_ports(), ensure_ascii=False, indent=2))
@@ -3446,6 +3617,25 @@ def main() -> int:
             if args.i2c_write_text is not None:
                 i2c_args["write_text"] = args.i2c_write_text
             print(json.dumps(server.call_tool("i2c_transact", i2c_args), ensure_ascii=False, indent=2))
+            return 0
+        except (BridgeError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.spi_transact:
+        try:
+            spi_args = {
+                "freq_id": args.spi_freq_id,
+                "phase": args.spi_phase,
+                "polarity": args.spi_polarity,
+                "cs": args.spi_cs,
+                "read_length": args.spi_read_length,
+                "delay_us": args.spi_delay_us,
+            }
+            if args.spi_write_hex is not None:
+                spi_args["write_hex"] = args.spi_write_hex
+            if args.spi_write_text is not None:
+                spi_args["write_text"] = args.spi_write_text
+            print(json.dumps(server.call_tool("spi_transact", spi_args), ensure_ascii=False, indent=2))
             return 0
         except (BridgeError, ValueError) as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)

@@ -169,6 +169,10 @@ Use h7tool protection_status for the selected STM32H7 profile and explain the re
 Use h7tool uart_transact on channel 1, 115200 8N1, send hex: 48 37 0D 0A, and read up to 64 response bytes.
 ```
 
+```text
+Use h7tool spi_transact with freq_id 0, phase 0, polarity 0, CS0, send hex 9F, and read 3 bytes.
+```
+
 Good workflow:
 
 1. Ask the AI to check `bridge_status`.
@@ -197,6 +201,7 @@ Good workflow:
 - `uart_transact`
 - `can_transact`
 - `i2c_transact`
+- `spi_transact`
 - `rtt_read`
 - `log_tail`
 - `read_memory`
