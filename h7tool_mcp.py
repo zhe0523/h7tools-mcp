@@ -824,6 +824,62 @@ def search_lua_examples(
     }
 
 
+def lua_authoring_rules() -> dict[str, Any]:
+    return {
+        "purpose": "Rules for AI-authored H7-TOOL Lua helper scripts.",
+        "workflow": [
+            "Search bundled examples first with lua_example_search.",
+            "Prefer existing MCP tools such as i2c_transact, spi_transact, uart_transact, can_transact, and rtt_read when they already cover the task.",
+            "When a custom Lua file is useful, write a small single-purpose script with bounded parameters and deterministic output.",
+            "Test syntax and output parsing offline where possible before running on hardware.",
+            "Run only one H7-TOOL hardware operation path at a time.",
+        ],
+        "required_output_style": [
+            "Print a unique BEGIN marker and END marker.",
+            "Print machine-readable key=value lines between the markers.",
+            "Always print enough fields to determine ok=true/false from the result.",
+            "Print hex bytes as uppercase two-digit values separated by spaces.",
+        ],
+        "safety_rules": [
+            "Keep loops bounded; avoid infinite monitor loops in generated scripts.",
+            "Limit read/write lengths and validate addresses before script generation.",
+            "Do not erase, program, unlock, change protection, power-cycle, or write option bytes unless the user explicitly asks for that class of action.",
+            "Do not embed private machine paths, device serial numbers, UIDs, or captured traffic in public files.",
+            "Prefer read-only or reversible bus transactions while exploring unknown hardware.",
+            "Always send stop/deassert operations for buses such as I2C/SPI on failure paths when the Lua API supports it.",
+        ],
+        "style_rules": [
+            "Use local variables for user-supplied values.",
+            "Use compact helper functions for hex formatting.",
+            "Keep scripts short enough for reliable transfer.",
+            "Return raw data first; let the MCP/Python layer do heavy interpretation when possible.",
+        ],
+        "templates": {
+            "i2c_register_read": [
+                'print("H7TOOL_USER_BEGIN")',
+                "i2c_bus(\"init\", CLK)",
+                "i2c_bus(\"start\")",
+                "ack=i2c_bus(\"send\", ADDR*2)",
+                "ack=i2c_bus(\"send\", REG)",
+                "i2c_bus(\"start\")",
+                "ack=i2c_bus(\"send\", ADDR*2+1)",
+                "rx=i2c_bus(\"recive\", LEN)",
+                "i2c_bus(\"stop\")",
+                'print("H7TOOL_USER_END")',
+            ],
+            "spi_command_read": [
+                'print("H7TOOL_USER_BEGIN")',
+                "spi_bus(\"init\", FREQ_ID, PHASE, POLARITY)",
+                "gpio_write(CS,0)",
+                "spi_bus(\"send\", TX)",
+                "rx=spi_bus(\"recive\", LEN)",
+                "gpio_write(CS,1)",
+                'print("H7TOOL_USER_END")',
+            ],
+        },
+    }
+
+
 def resolve_device_script(arguments: dict[str, Any]) -> Path:
     relative_path = arguments.get("relative_path")
     if isinstance(relative_path, str) and relative_path.strip():
@@ -2806,6 +2862,8 @@ class H7ToolMcp:
                 int(arguments.get("limit", 30)),
                 bool(arguments.get("include_programmer_profiles", False)),
             )
+        if name == "lua_authoring_rules":
+            return lua_authoring_rules()
         if name == "device_profile":
             return read_device_profile(arguments)
         if name == "device_capabilities":
@@ -2917,6 +2975,11 @@ TOOLS: list[dict[str, Any]] = [
             },
             "additionalProperties": False,
         },
+    },
+    {
+        "name": "lua_authoring_rules",
+        "description": "Return public safety and style rules for AI-authored H7-TOOL Lua helper scripts. Pure guidance; no hardware access.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "device_profile",
@@ -3447,6 +3510,9 @@ def self_test(_server: H7ToolMcp) -> int:
     assert any("BH1750" in item["title"] or "BH1750" in item["relative_path"] for item in i2c_examples["matches"])
     spi_profiles = search_lua_examples("W25Q", interface="spi", limit=20, include_programmer_profiles=True)
     assert any("W25Q" in item["title"] or "W25Q" in item["relative_path"] for item in spi_profiles["matches"])
+    authoring_rules = lua_authoring_rules()
+    assert authoring_rules["workflow"]
+    assert "i2c_register_read" in authoring_rules["templates"]
     device_profile = read_device_profile({"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"})
     assert device_profile["expected_idcode"] == "0x6BA02477"
     caps = device_capabilities({"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"})
@@ -3537,6 +3603,7 @@ def main() -> int:
     parser.add_argument("--lua-example-interface", choices=["i2c", "spi", "uart", "can", "rtt"], help="Restrict --lua-example-search to one interface")
     parser.add_argument("--lua-example-limit", type=int, default=30, help="Maximum Lua example search results")
     parser.add_argument("--include-programmer-profiles", action="store_true", help="Include SPI-Flash and I2C-EEPROM programmer profiles in --lua-example-search")
+    parser.add_argument("--lua-authoring-rules", action="store_true", help="Print public rules for AI-authored H7-TOOL Lua helper scripts")
     parser.add_argument("--device-profile", metavar="RELATIVE_PATH", help="Parse one local H7-TOOL device Lua profile")
     parser.add_argument("--device-capabilities", metavar="RELATIVE_PATH", help="Inspect one local H7-TOOL device Lua profile and summarize inferred capabilities")
     parser.add_argument("--self-test", action="store_true", help="Test MCP logic using only the built-in mock adapter")
@@ -3629,6 +3696,9 @@ def main() -> int:
                 indent=2,
             )
         )
+        return 0
+    if args.lua_authoring_rules:
+        print(json.dumps(lua_authoring_rules(), ensure_ascii=False, indent=2))
         return 0
     if args.device_profile is not None:
         print(json.dumps(read_device_profile({"relative_path": args.device_profile}), ensure_ascii=False, indent=2))

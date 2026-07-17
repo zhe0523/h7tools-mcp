@@ -10,6 +10,7 @@
 - 读取 H7-TOOL 状态和健康信息。
 - 按厂商、系列、芯片名搜索本地 H7-TOOL 设备 Lua 库。
 - 搜索 H7-TOOL 自带 Lua 示例和总线辅助脚本，辅助 AI 查找原始外设用法。
+- 提供 AI 编写 H7-TOOL Lua 辅助脚本的公开规则和安全边界。
 - 解析芯片 profile 中的接口类型、期望 ID、UID 位置、存储器范围、依赖库和算法条目。
 - 汇总 profile 能力，方便 AI 理解当前芯片配置大致支持哪些操作。
 - 探测已连接的 STM32H7 目标板，并与选定的本地 profile 合并成目标信息。
@@ -79,6 +80,7 @@ python h7tool_mcp.py --list-hid-devices
 python h7tool_mcp.py --device-vendors
 python h7tool_mcp.py --device-search STM32H743 --device-vendor ST
 python h7tool_mcp.py --lua-example-search BH1750 --lua-example-interface i2c
+python h7tool_mcp.py --lua-authoring-rules
 python h7tool_mcp.py --device-profile ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --lua-health
 python h7tool_mcp.py --target-identity ST/STM32H7xx/STM32H7x_2M.lua
@@ -188,6 +190,8 @@ codex mcp list
 
 这些客户端也按“本地 stdio MCP”配置。推荐直接看单独教程：[AI 客户端接入 H7-TOOL MCP 指南](docs/ai-clients.zh-CN.md)。
 
+AI 编写 Lua 辅助脚本的规则见：[AI 编写 H7-TOOL Lua 辅助脚本规则](docs/lua-authoring-rules.zh-CN.md)。
+
 ## 怎么让 AI 调用
 
 连接成功后，直接让 AI 使用 h7tool MCP 工具即可。示例：
@@ -202,6 +206,10 @@ codex mcp list
 
 ```text
 使用 h7tool lua_example_search 搜索 H7-TOOL 自带的 I2C BH1750 示例，并总结它的调用方式。
+```
+
+```text
+使用 h7tool lua_authoring_rules 获取 AI 编写 H7-TOOL Lua 辅助脚本时必须遵守的规则。
 ```
 
 ```text
@@ -250,6 +258,7 @@ codex mcp list
 - `device_vendors`
 - `device_search`
 - `lua_example_search`
+- `lua_authoring_rules`
 - `device_profile`
 - `device_capabilities`
 - `tool_status`

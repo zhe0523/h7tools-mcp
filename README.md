@@ -12,6 +12,7 @@ The public documentation only covers installation and usage. Product-internal co
 - Reads H7-TOOL status and health information.
 - Searches the local H7-TOOL device Lua library by vendor, series, or chip name.
 - Searches bundled H7-TOOL Lua examples and bus helper scripts so the AI can inspect original peripheral usage.
+- Provides public safety and style rules for AI-authored H7-TOOL Lua helper scripts.
 - Parses device profiles for interface type, expected ID, UID location, memory ranges, included libraries, and algorithm entries.
 - Summarizes profile capabilities so the AI can understand what a chip profile appears to support.
 - Probes a connected STM32H7 target and combines live results with the selected local profile.
@@ -81,6 +82,7 @@ Useful local checks:
 python h7tool_mcp.py --device-vendors
 python h7tool_mcp.py --device-search STM32H743 --device-vendor ST
 python h7tool_mcp.py --lua-example-search BH1750 --lua-example-interface i2c
+python h7tool_mcp.py --lua-authoring-rules
 python h7tool_mcp.py --device-profile ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --lua-health
 python h7tool_mcp.py --target-identity ST/STM32H7xx/STM32H7x_2M.lua
@@ -178,6 +180,8 @@ Chinese step-by-step guide: [Cherry Studio 配置 H7-TOOL MCP 教程](docs/cherr
 
 These clients use the same local stdio MCP idea. Chinese multi-client guide: [AI 客户端接入 H7-TOOL MCP 指南](docs/ai-clients.zh-CN.md).
 
+Lua helper authoring rules are documented in Chinese here: [AI 编写 H7-TOOL Lua 辅助脚本规则](docs/lua-authoring-rules.zh-CN.md).
+
 ## How To Ask The AI To Use It
 
 Once the MCP server is connected, ask the AI to use the H7-TOOL tools directly. Example prompts:
@@ -192,6 +196,10 @@ Use h7tool to search the local device library for STM32H743.
 
 ```text
 Use h7tool lua_example_search to find bundled I2C BH1750 examples and summarize how they are called.
+```
+
+```text
+Use h7tool lua_authoring_rules before drafting a custom H7-TOOL Lua helper script.
 ```
 
 ```text
@@ -240,6 +248,7 @@ Good workflow:
 - `device_vendors`
 - `device_search`
 - `lua_example_search`
+- `lua_authoring_rules`
 - `device_profile`
 - `device_capabilities`
 - `tool_status`
