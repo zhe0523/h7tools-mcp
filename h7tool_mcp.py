@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 
-SERVER_NAME = "h7tool-readonly-diagnostics"
+SERVER_NAME = "h7tool-mcp-assistant"
 SERVER_VERSION = "0.3.0"
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -2000,7 +2000,40 @@ def handle_request(server: H7ToolMcp, request: dict[str, Any]) -> dict[str, Any]
         return jsonrpc_response(request_id, result_message({"error": "Unexpected bridge error; see server stderr."}, is_error=True))
 
 
-def serve(server: H7ToolMcp) -> int:
+def write_mcp_response(response: dict[str, Any], framed: bool) -> None:
+    payload = json.dumps(response, ensure_ascii=False).encode("utf-8")
+    if framed and hasattr(sys.stdout, "buffer"):
+        sys.stdout.buffer.write(f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii"))
+        sys.stdout.buffer.write(payload)
+        sys.stdout.buffer.flush()
+        return
+    print(payload.decode("utf-8"), flush=True)
+
+
+def read_mcp_framed_body(stream: Any, first_header: bytes) -> str:
+    headers = [first_header]
+    while True:
+        line = stream.readline()
+        if line in {b"", b"\r\n", b"\n"}:
+            break
+        headers.append(line)
+    content_length = None
+    for header in headers:
+        if header.lower().startswith(b"content-length:"):
+            try:
+                content_length = int(header.split(b":", 1)[1].strip())
+            except ValueError as exc:
+                raise ValueError("Invalid Content-Length header") from exc
+            break
+    if content_length is None:
+        raise ValueError("Missing Content-Length header")
+    body = stream.read(content_length)
+    if len(body) != content_length:
+        raise ValueError("Unexpected EOF while reading MCP message body")
+    return body.decode("utf-8")
+
+
+def serve_text_lines(server: H7ToolMcp) -> int:
     for line in sys.stdin:
         try:
             request = json.loads(line)
@@ -2010,7 +2043,35 @@ def serve(server: H7ToolMcp) -> int:
         except (json.JSONDecodeError, ValueError) as exc:
             response = jsonrpc_response(None, error={"code": -32700, "message": f"Parse error: {exc}"})
         if response is not None:
-            print(json.dumps(response, ensure_ascii=False), flush=True)
+            write_mcp_response(response, framed=False)
+    return 0
+
+
+def serve(server: H7ToolMcp) -> int:
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is None:
+        return serve_text_lines(server)
+    framed = False
+    while True:
+        line = stream.readline()
+        if line == b"":
+            break
+        if line in {b"\r\n", b"\n"}:
+            continue
+        try:
+            if line.lower().startswith(b"content-length:"):
+                framed = True
+                message = read_mcp_framed_body(stream, line)
+            else:
+                message = line.decode("utf-8")
+            request = json.loads(message)
+            if not isinstance(request, dict):
+                raise ValueError("message must be an object")
+            response = handle_request(server, request)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            response = jsonrpc_response(None, error={"code": -32700, "message": f"Parse error: {exc}"})
+        if response is not None:
+            write_mcp_response(response, framed=framed)
     return 0
 
 
