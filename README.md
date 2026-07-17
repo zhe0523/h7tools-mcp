@@ -77,6 +77,7 @@ python h7tool_mcp.py --device-search STM32H743 --device-vendor ST
 python h7tool_mcp.py --device-profile ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --lua-health
 python h7tool_mcp.py --target-identity ST/STM32H7xx/STM32H7x_2M.lua
+python h7tool_mcp.py --target-summary ST/STM32H7xx/STM32H7x_2M.lua
 ```
 
 `config.json` is intentionally ignored by git because it contains local device settings.
@@ -148,6 +149,10 @@ Use h7tool target_identity with ST/STM32H7xx/STM32H7x_2M.lua and summarize the c
 ```
 
 ```text
+Use h7tool target_summary with ST/STM32H7xx/STM32H7x_2M.lua and recommend the next diagnostic step.
+```
+
+```text
 Use h7tool protection_status for the selected STM32H7 profile and explain the result.
 ```
 
@@ -156,7 +161,7 @@ Good workflow:
 1. Ask the AI to check `bridge_status`.
 2. Ask it to search or inspect the target device profile.
 3. Ask it to run `lua_health` or `health_summary`.
-4. Ask it to run `target_identity`.
+4. Ask it to run `target_summary`.
 5. Ask for focused reads or summaries only after the target profile is selected.
 
 ## Available MCP Tools
@@ -171,6 +176,7 @@ Good workflow:
 - `lua_health`
 - `target_probe`
 - `target_identity`
+- `target_summary`
 - `tool_registers`
 - `read_option_bytes`
 - `protection_status`

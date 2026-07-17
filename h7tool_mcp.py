@@ -586,6 +586,79 @@ def device_capabilities(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def summarize_target_identity(identity_result: dict[str, Any], protection_result: dict[str, Any] | None = None) -> dict[str, Any]:
+    identity = identity_result.get("identity", {})
+    profile = identity_result.get("profile", {})
+    if not isinstance(identity, dict):
+        identity = {}
+    if not isinstance(profile, dict):
+        profile = {}
+    algorithms = profile.get("algorithm_files", [])
+    if not isinstance(algorithms, list):
+        algorithms = []
+    algorithm_summary = [
+        {
+            "file": item.get("file"),
+            "address": item.get("address"),
+            "size_bytes": item.get("size_bytes"),
+        }
+        for item in algorithms
+        if isinstance(item, dict)
+    ]
+    option_byte_addresses = profile.get("option_byte_addresses", [])
+    protection_checks = profile.get("protection_checks", [])
+    has_option_bytes = isinstance(option_byte_addresses, list) and len(option_byte_addresses) > 0
+    has_protection_checks = isinstance(protection_checks, list) and len(protection_checks) > 0
+    connected = bool(identity.get("connected"))
+    idcode_match = bool(identity.get("idcode_match"))
+    warnings: list[str] = []
+    if not connected:
+        warnings.append("Target did not report a connected state.")
+    if connected and not idcode_match:
+        warnings.append("Live IDCODE does not match the selected profile.")
+    if not algorithm_summary:
+        warnings.append("Selected profile does not expose flash algorithm metadata.")
+    next_tools = ["device_capabilities"]
+    if connected:
+        next_tools.extend(["read_memory", "read_option_bytes" if has_option_bytes else "", "protection_status" if has_protection_checks else ""])
+    next_tools = [name for name in next_tools if name]
+    summary: dict[str, Any] = {
+        "profile": {
+            "relative_path": profile.get("relative_path"),
+            "vendor": profile.get("vendor"),
+            "series": profile.get("series"),
+            "device": profile.get("device"),
+        },
+        "target": {
+            "connected": connected,
+            "interface": identity.get("interface"),
+            "idcode": identity.get("idcode"),
+            "expected_idcode": identity.get("expected_idcode"),
+            "idcode_match": idcode_match,
+            "uid_address": identity.get("uid_address"),
+            "uid_length": identity.get("uid_length"),
+            "uid_hex": identity.get("uid_hex"),
+        },
+        "memory": {
+            "flash_address": identity.get("flash_address"),
+            "ram_address": identity.get("ram_address"),
+            "algorithm_ram_address": profile.get("algorithm_ram_address"),
+            "algorithm_ram_size_bytes": profile.get("algorithm_ram_size_bytes"),
+            "flash_algorithms": algorithm_summary,
+        },
+        "profile_support": {
+            "option_byte_address_count": len(option_byte_addresses) if isinstance(option_byte_addresses, list) else 0,
+            "protection_check_count": len(protection_checks) if isinstance(protection_checks, list) else 0,
+            "include_count": len(profile.get("include_list", [])) if isinstance(profile.get("include_list"), list) else 0,
+        },
+        "next_tools": next_tools,
+        "warnings": warnings,
+    }
+    if protection_result is not None:
+        summary["protection"] = protection_result.get("status", protection_result)
+    return summary
+
+
 def crc16_modbus(data: bytes) -> int:
     """CRC-16/MODBUS, as used by the legacy H7-TOOL USB/UDP RTU framing."""
     crc = 0xFFFF
@@ -1602,6 +1675,28 @@ class H7ToolMcp:
             },
         }
 
+    def target_summary(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        include_protection = bool(arguments.get("include_protection", False))
+        identity_args = {key: value for key, value in arguments.items() if key != "include_protection"}
+        identity_result = self.target_identity(identity_args)
+        protection_result = None
+        protection_error = None
+        if include_protection:
+            try:
+                protection_result = self.protection_status(identity_args)
+            except BridgeError as exc:
+                protection_error = str(exc)
+        summary = summarize_target_identity(identity_result, protection_result)
+        result: dict[str, Any] = {
+            "summary": summary,
+            "identity": identity_result,
+        }
+        if protection_result is not None:
+            result["protection_status"] = protection_result
+        if protection_error is not None:
+            result["protection_error"] = protection_error
+        return result
+
     def health_summary(self) -> dict[str, Any]:
         if self.adapter.kind not in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
             raise BridgeError("health_summary requires adapter.type = modbus_tcp, modbus_udp, or h7tool_hid")
@@ -1646,6 +1741,8 @@ class H7ToolMcp:
             return self.run_configured_command("target_probe", arguments)
         if name == "target_identity":
             return self.target_identity(arguments)
+        if name == "target_summary":
+            return self.target_summary(arguments)
         if name == "read_option_bytes":
             return self.read_option_bytes(arguments)
         if name == "protection_status":
@@ -1762,6 +1859,21 @@ TOOLS: list[dict[str, Any]] = [
                 "vendor": {"type": "string"},
                 "series": {"type": "string"},
                 "device": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "target_summary",
+        "description": "Build a concise target summary for AI reporting and next-step planning. Optionally includes protection status when the selected profile supports it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "vendor": {"type": "string"},
+                "series": {"type": "string"},
+                "device": {"type": "string"},
+                "include_protection": {"type": "boolean", "default": False},
             },
             "additionalProperties": False,
         },
@@ -1986,6 +2098,33 @@ def self_test(_server: H7ToolMcp) -> int:
         {"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"},
     )
     assert selected_profile["relative_path"] == "ST/STM32H7xx/STM32H7x_2M.lua"
+    synthetic_summary = summarize_target_identity(
+        {
+            "profile": {
+                "relative_path": "ST/STM32H7xx/STM32H7x_2M.lua",
+                "vendor": "ST",
+                "series": "STM32H7xx",
+                "device": "STM32H7x_2M",
+                "algorithm_files": [{"file": "STM32H7x_2M.FLM", "address": "0x08000000", "size_bytes": 2097152}],
+                "option_byte_addresses": ["0x52002020"],
+                "protection_checks": [{"address": "0x5200201D"}],
+                "include_list": ["0:/H7-TOOL/Programmer/Device/ST/STM32H7xx/Lib/STM32H7xx.lua"],
+            },
+            "identity": {
+                "connected": True,
+                "interface": "SWD",
+                "idcode": "0x6BA02477",
+                "expected_idcode": "0x6BA02477",
+                "idcode_match": True,
+                "uid_hex": "3C 00 1E 00",
+                "flash_address": "0x08000000",
+                "ram_address": "0x20000000",
+            },
+        }
+    )
+    assert synthetic_summary["target"]["idcode_match"] is True
+    assert synthetic_summary["profile_support"]["option_byte_address_count"] == 1
+    assert "protection_status" in synthetic_summary["next_tools"]
     try:
         server.call_tool("read_memory", {"address": "0x20000000", "length": 4096})
     except BridgeError:
@@ -2019,6 +2158,8 @@ def main() -> int:
     parser.add_argument("--lua-health", action="store_true", help="Run the bundled Lua health check through the configured HID adapter")
     parser.add_argument("--target-probe", action="store_true", help="Run the configured target probe and print JSON")
     parser.add_argument("--target-identity", nargs="?", const="", metavar="RELATIVE_PATH", help="Build the target identity profile; optionally select a local device Lua relative path")
+    parser.add_argument("--target-summary", nargs="?", const="", metavar="RELATIVE_PATH", help="Build a concise target summary; optionally select a local device Lua relative path")
+    parser.add_argument("--include-protection-status", action="store_true", help="With --target-summary, also include protection status when available")
     parser.add_argument("--read-option-bytes", nargs="?", const="", metavar="RELATIVE_PATH", help="Read option bytes using a selected local device Lua profile")
     parser.add_argument("--protection-status", nargs="?", const="", metavar="RELATIVE_PATH", help="Read and summarize protection status using a selected local device Lua profile")
     parser.add_argument("--read-memory", nargs=2, metavar=("ADDRESS", "LENGTH"), help="Read a bounded target memory range through the configured adapter")
@@ -2084,6 +2225,16 @@ def main() -> int:
         try:
             identity_args = {"relative_path": args.target_identity} if args.target_identity else {}
             print(json.dumps(server.call_tool("target_identity", identity_args), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.target_summary is not None:
+        try:
+            summary_args = {"relative_path": args.target_summary} if args.target_summary else {}
+            if args.include_protection_status:
+                summary_args["include_protection"] = True
+            print(json.dumps(server.call_tool("target_summary", summary_args), ensure_ascii=False, indent=2))
             return 0
         except BridgeError as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
