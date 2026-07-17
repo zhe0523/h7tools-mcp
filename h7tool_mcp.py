@@ -642,6 +642,41 @@ class H7ToolHidModbusAdapter:
         frame = report[:frame_length]
         return frame if crc16_modbus(frame[:-2]) == int.from_bytes(frame[-2:], "little") else None
 
+    @staticmethod
+    def _report(frame: bytes) -> bytes:
+        if len(frame) > 1024:
+            raise BridgeError("H7-TOOL HID frame is larger than one 1024-byte payload report")
+        return b"\0" + frame + b"\0" * (1025 - 1 - len(frame))
+
+    @staticmethod
+    def _extract_lua_ack(report: bytes) -> bool:
+        """Return True for a V2.33 HID function-0x64 success acknowledgement."""
+        if len(report) < 19 or report[0] != 1 or report[1] != 0x64:
+            return False
+        frame = report[:19]
+        if crc16_modbus(frame[:-2]) != int.from_bytes(frame[-2:], "little"):
+            return False
+        return frame[2:4] == b"\0\0"
+
+    @staticmethod
+    def _extract_lua_print(report: bytes) -> bytes | None:
+        """Extract one function-0x61 print payload from a V2.33 HID report."""
+        if len(report) < 10 or report[0] != 1 or report[1] != 0x61:
+            return None
+        text_length = int.from_bytes(report[6:8], "big")
+        frame_length = 10 + text_length
+        if frame_length > len(report):
+            return None
+        frame = report[:frame_length]
+        if crc16_modbus(frame[:-2]) != int.from_bytes(frame[-2:], "little"):
+            return None
+        return frame[8 : 8 + text_length]
+
+    @staticmethod
+    def _lua_poll_frame(channel: int) -> bytes:
+        body = bytes([1, 0x61, 0, channel, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0])
+        return body + crc16_modbus(body).to_bytes(2, "little")
+
     def read_holding_registers(self, address: int, count: int) -> list[int]:
         if not 0 <= address <= 0xFFFF or not 1 <= count <= 60:
             raise BridgeError("Modbus read address must be 0..65535 and count must be 1..60")
@@ -693,6 +728,79 @@ class H7ToolHidModbusAdapter:
         raise BridgeError(
             "No matching H7-TOOL HID response. Verify the vendor PC application is closed and the tool is not in another active HID mode."
         )
+
+    def run_health_script(self) -> dict[str, Any]:
+        try:
+            import hid  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
+        script_path = Path(__file__).with_name("diagnostics") / "tool_health.lua"
+        try:
+            script = script_path.read_bytes()
+        except OSError as exc:
+            raise BridgeError(f"Cannot read bundled health script: {exc}") from exc
+        if b"H7TOOL_DIAG_BEGIN" not in script or b"H7TOOL_DIAG_END" not in script:
+            raise BridgeError("Bundled health script failed its safety marker check")
+        item = self._find_interface()
+        timeout_ms = max(1000, int(self.config.get("timeout_ms", 8000)))
+        payload = script + (b"" if script.endswith(b"\0") else b"\0")
+        request_body = struct.pack(">BBHIII", 1, 0x64, 0, len(payload), 0, len(payload)) + payload
+        request = request_body + crc16_modbus(request_body).to_bytes(2, "little")
+        output = bytearray()
+        ack_seen = False
+        reports = 0
+        dev = hid.device()
+        try:
+            dev.open_path(item["path"])
+            written = dev.write(self._report(request))
+            if written != 1025:
+                raise BridgeError("H7-TOOL HID write did not accept the Lua request")
+            deadline = time.monotonic() + timeout_ms / 1000
+            next_poll = 0.0
+            channel = 0
+            while time.monotonic() < deadline:
+                now = time.monotonic()
+                if now >= next_poll:
+                    dev.write(self._report(self._lua_poll_frame(channel)))
+                    channel = (channel + 1) % 5
+                    next_poll = now + 0.02
+                report = bytes(dev.read(1024, 50))
+                if not report:
+                    continue
+                reports += 1
+                if self._extract_lua_ack(report):
+                    ack_seen = True
+                    continue
+                text = self._extract_lua_print(report)
+                if text is not None:
+                    text = text.rstrip(b"\xff")
+                    if not text.strip(b"\0"):
+                        continue
+                    text = text.lstrip(b"\0")
+                    output.extend(text)
+                    decoded = output.decode("utf-8", errors="replace")
+                    if "H7TOOL_DIAG_END" in decoded:
+                        break
+        except BridgeError:
+            raise
+        except Exception as exc:  # hidapi has platform-specific exception types
+            raise BridgeError(f"H7-TOOL HID Lua request failed: {exc}") from exc
+        finally:
+            try:
+                dev.close()
+            except Exception:
+                pass
+        decoded = output.decode("utf-8", errors="replace").strip()
+        if not ack_seen:
+            raise BridgeError("No H7-TOOL HID Lua acknowledgement; close the vendor PC application and retry")
+        if "H7TOOL_DIAG_BEGIN" not in decoded or "H7TOOL_DIAG_END" not in decoded:
+            raise BridgeError(f"Lua was acknowledged but diagnostic output was incomplete: {decoded!r}")
+        return {
+            "transport": "h7tool_hid/function_64_lua + function_61_print_poll",
+            "script": "diagnostics/tool_health.lua",
+            "reports": reports,
+            "result": parse_response(output),
+        }
 
 
 class H7ToolMcp:
@@ -776,6 +884,9 @@ class H7ToolMcp:
     def read_lua_health(self) -> dict[str, Any]:
         return LegacyH7ToolLuaSerialAdapter(self.config["adapter"]).run_health_script()
 
+    def read_hid_lua_health(self) -> dict[str, Any]:
+        return self.hid_modbus.run_health_script()
+
     def health_summary(self) -> dict[str, Any]:
         if self.adapter.kind not in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
             raise BridgeError("health_summary requires adapter.type = modbus_tcp, modbus_udp, or h7tool_hid")
@@ -793,6 +904,10 @@ class H7ToolMcp:
             return self.run_configured_command("status", arguments)
         if name == "health_summary":
             return self.health_summary()
+        if name == "lua_health":
+            if self.adapter.kind != "h7tool_hid":
+                raise BridgeError("lua_health requires adapter.type = h7tool_hid")
+            return self.read_hid_lua_health()
         if name == "tool_registers":
             if self.adapter.kind not in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
                 raise BridgeError("tool_registers requires adapter.type = modbus_tcp, modbus_udp, or h7tool_hid")
@@ -834,6 +949,11 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "health_summary",
         "description": "Produce a conservative read-only H7-TOOL health assessment: UID, versions, internal supply rails, NTC availability, target-facing observations, and warnings.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "lua_health",
+        "description": "Run only the bundled read-only diagnostics/tool_health.lua over the verified H7-TOOL HID Communication interface and return its print output.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -977,6 +1097,14 @@ def self_test(_server: H7ToolMcp) -> int:
         }
     )
     assert summary["overall"] == "ok" and summary["unknown_count"] == 1
+    lua_text = b"H7TOOL_DIAG_BEGIN\nuptime_ms=1\nH7TOOL_DIAG_END\n"
+    lua_body = bytes([1, 0x61, 0, 0, 0, 0]) + len(lua_text).to_bytes(2, "big") + lua_text
+    lua_report = lua_body + crc16_modbus(lua_body).to_bytes(2, "little")
+    assert H7ToolHidModbusAdapter._extract_lua_print(lua_report + b"\xff" * 16) == lua_text
+    ack_body = struct.pack(">BBBHIII", 1, 0x64, 0, 0, len(lua_text), 0, len(lua_text))
+    ack_report = ack_body + crc16_modbus(ack_body).to_bytes(2, "little")
+    assert H7ToolHidModbusAdapter._extract_lua_ack(ack_report + b"\xff" * 16)
+    assert H7ToolHidModbusAdapter._lua_poll_frame(0).hex() == "016100000000100000000000000029ed"
     try:
         server.call_tool("read_memory", {"address": "0x20000000", "length": 4096})
     except BridgeError:
@@ -1001,6 +1129,7 @@ def main() -> int:
     parser.add_argument("--self-test", action="store_true", help="Test MCP logic using only the built-in mock adapter")
     parser.add_argument("--probe-h7tool", action="store_true", help="Run the configured read-only tool_status probe and print JSON")
     parser.add_argument("--health-summary", action="store_true", help="Run the configured conservative read-only health assessment and print JSON")
+    parser.add_argument("--lua-health", action="store_true", help="Run the bundled read-only Lua health script through the configured HID adapter")
     parser.add_argument("--tool-registers", nargs=2, metavar=("ADDRESS", "COUNT"), help="Read bounded H7-TOOL holding registers through the configured Modbus adapter")
     args = parser.parse_args()
     if args.list_serial_ports:
@@ -1023,6 +1152,13 @@ def main() -> int:
     if args.health_summary:
         try:
             print(json.dumps(server.call_tool("health_summary", {}), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.lua_health:
+        try:
+            print(json.dumps(server.call_tool("lua_health", {}), ensure_ascii=False, indent=2))
             return 0
         except BridgeError as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)

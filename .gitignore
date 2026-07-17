@@ -5,3 +5,5 @@ __pycache__/
 h7tool_udp.etl
 h7tool_udp.pcapng
 h7tool_udp.txt
+h7tool_usb*.pcap
+probe_usbpcap_*.pcap

@@ -19,6 +19,9 @@ private protocol.
 - A verified V2.33 `h7tool_hid` adapter for the current H7-TOOL USB HID
   Communication interface: VID:C251/PID:F00A, interface 2. It implements
   only Modbus function `0x03` reads using 1024-byte HID payload reports.
+- A verified HID Lua diagnostics path for the bundled fixed
+  `diagnostics/tool_health.lua`: function `0x64` downloads/runs the script and
+  function `0x61` is polled over HID to collect `print()` output.
 
 The hardware-facing commands are intentionally disabled until their exact
 syntax and response framing are confirmed with the real device.
@@ -40,6 +43,15 @@ select Ethernet/WiFi, then use the current local configuration:
 & $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --probe-h7tool
 & $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --health-summary
 & $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --tool-registers 0x0400 6
+```
+
+For the USB HID path, close the vendor PC application if it is actively using
+the same HID Communication interface, then use:
+
+```powershell
+Copy-Item .\mcp\config.usb-hid.example.json .\mcp\config.json -Force
+& $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --probe-h7tool
+& $py .\mcp\h7tool_mcp.py --config .\mcp\config.json --lua-health
 ```
 
 For an Ethernet device with its LAN interface actually enabled, configure a
@@ -98,9 +110,10 @@ control. The allowed adapter types:
   configured line; requires `pyserial`.
 - `h7tool_hid`: verified current USB transport. It selects only the
   vendor-defined `H7-TOOL HID Communication` interface and provides only
-  function-`0x03` read access. It is verified with V2.33 using 1024-byte
-  reports and standard low-byte-first Modbus CRC. Close the vendor PC
-  application before use because it otherwise owns the same HID reports.
+  function-`0x03` read access plus the fixed bundled `tool_health.lua`
+  diagnostic runner. It is verified with V2.33 using 1024-byte reports and
+  standard low-byte-first Modbus CRC. Close the vendor PC application before
+  use if it otherwise owns the same HID reports.
 
 The `commands` values are Python format templates. Only the following
 read-oriented names are accepted by the bridge: `status`, `target_probe`,
@@ -129,3 +142,8 @@ The verified V2.33 UDP transport uses standard low-byte-first Modbus CRC and
 a five-frame `0x61` read-only channel poll before register reads. The device
 adds one zero padding byte to some replies; the bridge strips it based on the
 function-`0x03` byte count.
+
+The verified V2.33 HID Lua flow mirrors the vendor PC "Download" action: send
+one padded 1024-byte HID payload containing function `0x64`, then poll channels
+0..4 with function `0x61` until the fixed script's `H7TOOL_DIAG_END` marker is
+seen. The MCP bridge does not accept caller-provided Lua.
