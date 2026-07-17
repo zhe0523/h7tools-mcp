@@ -78,6 +78,7 @@ python h7tool_mcp.py --device-profile ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --lua-health
 python h7tool_mcp.py --target-identity ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --target-summary ST/STM32H7xx/STM32H7x_2M.lua
+python h7tool_mcp.py --target-flash-info ST/STM32H7xx/STM32H7x_2M.lua
 ```
 
 `config.json` is intentionally ignored by git because it contains local device settings.
@@ -185,6 +186,7 @@ Good workflow:
 - `target_probe`
 - `target_identity`
 - `target_summary`
+- `target_flash_info`
 - `tool_registers`
 - `read_option_bytes`
 - `protection_status`

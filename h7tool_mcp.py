@@ -620,7 +620,7 @@ def summarize_target_identity(identity_result: dict[str, Any], protection_result
         warnings.append("Selected profile does not expose flash algorithm metadata.")
     next_tools = ["device_capabilities"]
     if connected:
-        next_tools.extend(["read_memory", "read_option_bytes" if has_option_bytes else "", "protection_status" if has_protection_checks else ""])
+        next_tools.extend(["read_memory", "target_flash_info", "read_option_bytes" if has_option_bytes else "", "protection_status" if has_protection_checks else ""])
     next_tools = [name for name in next_tools if name]
     summary: dict[str, Any] = {
         "profile": {
@@ -657,6 +657,69 @@ def summarize_target_identity(identity_result: dict[str, Any], protection_result
     if protection_result is not None:
         summary["protection"] = protection_result.get("status", protection_result)
     return summary
+
+
+def primary_flash_algorithm_size(profile: dict[str, Any]) -> int | None:
+    flash_address = profile.get("flash_address")
+    algorithms = profile.get("algorithm_files", [])
+    if not isinstance(flash_address, str) or not isinstance(algorithms, list):
+        return None
+    for item in algorithms:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("address", "")).upper() == flash_address.upper() and isinstance(item.get("size_bytes"), int):
+            return item["size_bytes"]
+    return None
+
+
+def default_flash_size_register(profile: dict[str, Any]) -> int | None:
+    vendor = str(profile.get("vendor", "")).upper()
+    series = str(profile.get("series", "")).upper()
+    if vendor == "ST" and series.startswith("STM32H7"):
+        return 0x1FF1E880
+    return None
+
+
+def summarize_flash_info(profile: dict[str, Any], memory_result: dict[str, Any], address: int) -> dict[str, Any]:
+    data = memory_result.get("result", {}).get("data", {})
+    bytes_text = data.get("data_bytes", []) if isinstance(data, dict) else []
+    values: list[int] = []
+    if isinstance(bytes_text, list):
+        for item in bytes_text[:2]:
+            try:
+                values.append(int(str(item), 16))
+            except ValueError:
+                pass
+    register_kb = values[0] | (values[1] << 8) if len(values) >= 2 else None
+    register_bytes = register_kb * 1024 if register_kb is not None else None
+    profile_bytes = primary_flash_algorithm_size(profile)
+    match = register_bytes == profile_bytes if register_bytes is not None and profile_bytes is not None else None
+    warnings: list[str] = []
+    if register_bytes is None:
+        warnings.append("Flash size register could not be decoded.")
+    if match is False:
+        warnings.append("Flash size register does not match the selected profile primary flash algorithm size.")
+    return {
+        "profile": {
+            "relative_path": profile.get("relative_path"),
+            "vendor": profile.get("vendor"),
+            "series": profile.get("series"),
+            "device": profile.get("device"),
+        },
+        "register": {
+            "address": _format_hex(address, 8),
+            "raw_hex": data.get("data_hex") if isinstance(data, dict) else None,
+            "size_kb": register_kb,
+            "size_bytes": register_bytes,
+        },
+        "profile_flash": {
+            "flash_address": profile.get("flash_address"),
+            "primary_algorithm_size_bytes": profile_bytes,
+            "size_match": match,
+        },
+        "warnings": warnings,
+        "raw_read": memory_result.get("result"),
+    }
 
 
 def crc16_modbus(data: bytes) -> int:
@@ -1677,16 +1740,36 @@ class H7ToolMcp:
 
     def target_summary(self, arguments: dict[str, Any]) -> dict[str, Any]:
         include_protection = bool(arguments.get("include_protection", False))
-        identity_args = {key: value for key, value in arguments.items() if key != "include_protection"}
+        include_flash_info = bool(arguments.get("include_flash_info", False))
+        identity_args = {key: value for key, value in arguments.items() if key not in {"include_protection", "include_flash_info", "flash_size_address"}}
         identity_result = self.target_identity(identity_args)
         protection_result = None
         protection_error = None
+        flash_info_result = None
+        flash_info_error = None
         if include_protection:
             try:
                 protection_result = self.protection_status(identity_args)
             except BridgeError as exc:
                 protection_error = str(exc)
+        if include_flash_info:
+            try:
+                flash_info_args = dict(identity_args)
+                if "flash_size_address" in arguments:
+                    flash_info_args["address"] = arguments["flash_size_address"]
+                flash_info_result = self.target_flash_info(flash_info_args)
+            except BridgeError as exc:
+                flash_info_error = str(exc)
         summary = summarize_target_identity(identity_result, protection_result)
+        if flash_info_result is not None:
+            flash_warnings = flash_info_result.get("warnings", [])
+            if isinstance(flash_warnings, list):
+                summary.setdefault("warnings", []).extend(str(item) for item in flash_warnings)
+            summary["flash_info"] = {
+                "register": flash_info_result.get("register"),
+                "profile_flash": flash_info_result.get("profile_flash"),
+                "warnings": flash_warnings,
+            }
         result: dict[str, Any] = {
             "summary": summary,
             "identity": identity_result,
@@ -1695,7 +1778,27 @@ class H7ToolMcp:
             result["protection_status"] = protection_result
         if protection_error is not None:
             result["protection_error"] = protection_error
+        if flash_info_result is not None:
+            result["flash_info"] = flash_info_result
+        if flash_info_error is not None:
+            result["flash_info_error"] = flash_info_error
         return result
+
+    def target_flash_info(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError("target_flash_info currently requires adapter.type = h7tool_hid")
+        profile = read_selected_target_profile(self.config, arguments)
+        address_text = arguments.get("address")
+        if isinstance(address_text, str) and address_text.strip():
+            if not address_text.startswith("0x"):
+                raise BridgeError("address must be hexadecimal, for example 0x1FF1E880")
+            address = int(address_text, 16)
+        else:
+            address = default_flash_size_register(profile)
+            if address is None:
+                raise BridgeError("No default flash-size register is known for the selected profile; provide address")
+        memory_result = self.read_hid_target_memory(address, 4)
+        return summarize_flash_info(profile, memory_result, address)
 
     def health_summary(self) -> dict[str, Any]:
         if self.adapter.kind not in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
@@ -1743,6 +1846,8 @@ class H7ToolMcp:
             return self.target_identity(arguments)
         if name == "target_summary":
             return self.target_summary(arguments)
+        if name == "target_flash_info":
+            return self.target_flash_info(arguments)
         if name == "read_option_bytes":
             return self.read_option_bytes(arguments)
         if name == "protection_status":
@@ -1874,6 +1979,23 @@ TOOLS: list[dict[str, Any]] = [
                 "series": {"type": "string"},
                 "device": {"type": "string"},
                 "include_protection": {"type": "boolean", "default": False},
+                "include_flash_info": {"type": "boolean", "default": False},
+                "flash_size_address": {"type": "string", "pattern": "^0x[0-9A-Fa-f]+$"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "target_flash_info",
+        "description": "Read a target flash-size register for the selected profile and compare it with the profile primary flash algorithm size.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "vendor": {"type": "string"},
+                "series": {"type": "string"},
+                "device": {"type": "string"},
+                "address": {"type": "string", "pattern": "^0x[0-9A-Fa-f]+$"},
             },
             "additionalProperties": False,
         },
@@ -2186,6 +2308,29 @@ def self_test(_server: H7ToolMcp) -> int:
     assert synthetic_summary["target"]["idcode_match"] is True
     assert synthetic_summary["profile_support"]["option_byte_address_count"] == 1
     assert "protection_status" in synthetic_summary["next_tools"]
+    flash_info = summarize_flash_info(
+        {
+            "relative_path": "ST/STM32H7xx/STM32H7x_2M.lua",
+            "vendor": "ST",
+            "series": "STM32H7xx",
+            "device": "STM32H7x_2M",
+            "flash_address": "0x08000000",
+            "algorithm_files": [{"address": "0x08000000", "size_bytes": 2 * 1024 * 1024}],
+        },
+        {
+            "result": {
+                "data": {
+                    "data_hex": "80 00 00 00",
+                    "data_bytes": ["80", "00", "00", "00"],
+                }
+            }
+        },
+        0x1FF1E880,
+    )
+    assert flash_info["register"]["size_kb"] == 128
+    assert flash_info["register"]["size_bytes"] == 128 * 1024
+    assert flash_info["profile_flash"]["size_match"] is False
+    assert default_flash_size_register({"vendor": "ST", "series": "STM32H7xx"}) == 0x1FF1E880
     try:
         server.call_tool("read_memory", {"address": "0x20000000", "length": 4096})
     except BridgeError:
@@ -2221,6 +2366,9 @@ def main() -> int:
     parser.add_argument("--target-identity", nargs="?", const="", metavar="RELATIVE_PATH", help="Build the target identity profile; optionally select a local device Lua relative path")
     parser.add_argument("--target-summary", nargs="?", const="", metavar="RELATIVE_PATH", help="Build a concise target summary; optionally select a local device Lua relative path")
     parser.add_argument("--include-protection-status", action="store_true", help="With --target-summary, also include protection status when available")
+    parser.add_argument("--include-flash-info", action="store_true", help="With --target-summary, also include target flash-size register information when available")
+    parser.add_argument("--target-flash-info", nargs="?", const="", metavar="RELATIVE_PATH", help="Read target flash-size information; optionally select a local device Lua relative path")
+    parser.add_argument("--flash-size-address", metavar="ADDRESS", help="Override the target flash-size register address for --target-flash-info or --target-summary")
     parser.add_argument("--read-option-bytes", nargs="?", const="", metavar="RELATIVE_PATH", help="Read option bytes using a selected local device Lua profile")
     parser.add_argument("--protection-status", nargs="?", const="", metavar="RELATIVE_PATH", help="Read and summarize protection status using a selected local device Lua profile")
     parser.add_argument("--read-memory", nargs=2, metavar=("ADDRESS", "LENGTH"), help="Read a bounded target memory range through the configured adapter")
@@ -2295,7 +2443,21 @@ def main() -> int:
             summary_args = {"relative_path": args.target_summary} if args.target_summary else {}
             if args.include_protection_status:
                 summary_args["include_protection"] = True
+            if args.include_flash_info:
+                summary_args["include_flash_info"] = True
+            if args.flash_size_address:
+                summary_args["flash_size_address"] = args.flash_size_address
             print(json.dumps(server.call_tool("target_summary", summary_args), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.target_flash_info is not None:
+        try:
+            flash_args = {"relative_path": args.target_flash_info} if args.target_flash_info else {}
+            if args.flash_size_address:
+                flash_args["address"] = args.flash_size_address
+            print(json.dumps(server.call_tool("target_flash_info", flash_args), ensure_ascii=False, indent=2))
             return 0
         except BridgeError as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
