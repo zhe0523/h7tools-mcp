@@ -1,5 +1,7 @@
 # H7-TOOL read-only diagnostic MCP bridge
 
+[中文说明](README.zh-CN.md)
+
 This is a read-only MCP server intended for **diagnosis only**.
 It deliberately exposes no erase, flash, reset, power-control, GPIO-write, or
 protection-changing tool. It does not reverse engineer or assume H7-TOOL's
