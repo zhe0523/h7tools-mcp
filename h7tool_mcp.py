@@ -169,7 +169,11 @@ def parse_option_bytes_output(raw: bytes) -> dict[str, Any]:
 def parse_uart_transact_output(raw: bytes) -> dict[str, Any]:
     text = raw.decode("utf-8", errors="replace").strip()
     data: dict[str, Any] = {}
+    errors: list[str] = []
     for line in text.splitlines():
+        stripped_line = line.strip()
+        if "parameter error" in stripped_line.lower() or stripped_line.lower().startswith("error :"):
+            errors.append(stripped_line)
         if "=" not in line:
             continue
         key, value = line.split("=", 1)
@@ -188,7 +192,9 @@ def parse_uart_transact_output(raw: bytes) -> dict[str, Any]:
             data["rx_text"] = value
         else:
             data[key] = value
-    data["ok"] = data.get("configured") == 1 and isinstance(data.get("rx_len"), int)
+    if errors:
+        data["errors"] = errors
+    data["ok"] = not errors and data.get("configured") == 1 and isinstance(data.get("rx_len"), int)
     return {"raw": text, "format": "h7tool_uart_transact", "data": data}
 
 
@@ -1719,6 +1725,10 @@ local function hx(b)
  end
  return r
 end
+if COM==7 and gpio_cfg then
+ gpio_cfg(0,5)
+ gpio_cfg(1,5)
+end
 uart_cfg(COM,BAUD,PARITY,DATABITS,STOPBITS)
 print("configured=1")
 print("channel="..COM)
@@ -2465,7 +2475,13 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "channel": {"type": "integer", "minimum": 1, "maximum": 8, "default": 1},
+                "channel": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "default": 1,
+                    "description": "Lua UART port. H7-TOOL UART1 uses 1; UART2 D0/D1 uses 7.",
+                },
                 "baudrate": {"type": "integer", "minimum": 1200, "maximum": 3000000, "default": 115200},
                 "parity": {"type": "integer", "enum": [0, 1, 2], "default": 0},
                 "data_bits": {"type": "integer", "enum": [7, 8], "default": 8},
