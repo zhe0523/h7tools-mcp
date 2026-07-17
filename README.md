@@ -195,6 +195,7 @@ Good workflow:
 - `read_option_bytes`
 - `protection_status`
 - `uart_transact`
+- `can_transact`
 - `rtt_read`
 - `log_tail`
 - `read_memory`

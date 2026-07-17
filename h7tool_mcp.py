@@ -198,6 +198,36 @@ def parse_uart_transact_output(raw: bytes) -> dict[str, Any]:
     return {"raw": text, "format": "h7tool_uart_transact", "data": data}
 
 
+def parse_can_transact_output(raw: bytes) -> dict[str, Any]:
+    text = raw.decode("utf-8", errors="replace").strip()
+    data: dict[str, Any] = {}
+    errors: list[str] = []
+    for line in text.splitlines():
+        stripped_line = line.strip()
+        if "parameter error" in stripped_line.lower() or stripped_line.lower().startswith("error :"):
+            errors.append(stripped_line)
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        key_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)$", key)
+        if key_match:
+            key = key_match.group(1)
+        if key in {"opened", "mode", "fifo_len", "bitrate", "data_bitrate", "frame_id", "extended", "remote", "tx_len", "tx_count", "interval_ms"}:
+            data[key] = _parse_lua_number(value)
+        elif key == "tx_hex":
+            parts = [part.upper() for part in value.split() if part]
+            data["tx_hex"] = " ".join(parts)
+            data["tx_bytes"] = parts
+        else:
+            data[key] = value
+    if errors:
+        data["errors"] = errors
+    data["ok"] = not errors and data.get("opened") == 1 and isinstance(data.get("tx_count"), int)
+    return {"raw": text, "format": "h7tool_can_transact", "data": data}
+
+
 def parse_rtt_read_output(raw: bytes) -> dict[str, Any]:
     text = raw.decode("utf-8", errors="replace").strip()
     data: dict[str, Any] = {}
@@ -1750,6 +1780,55 @@ print("H7TOOL_UART_END")
         result["result"] = parse_uart_transact_output(result["result"]["raw"].encode("utf-8", errors="replace"))
         return result
 
+    def run_can_transact_script(
+        self,
+        mode: int,
+        fifo_len: int,
+        bitrate: int,
+        data_bitrate: int,
+        frame_id: int,
+        extended: int,
+        remote: int,
+        tx_data: bytes,
+        count: int,
+        interval_ms: int,
+    ) -> dict[str, Any]:
+        tx_literal = lua_string_literal(tx_data)
+        tx_hex = " ".join(f"{byte:02X}" for byte in tx_data)
+        script = f"""print("H7TOOL_CAN_BEGIN")
+local MODE={mode}
+local FIFO={fifo_len}
+local BITRATE={bitrate}
+local DBITRATE={data_bitrate}
+local ID=0x{frame_id:X}
+local EXT={extended}
+local REMOTE={remote}
+local TX={tx_literal}
+local COUNT={count}
+local INTERVAL={interval_ms}
+can_bus("open",MODE,FIFO,BITRATE,DBITRATE)
+print("opened=1")
+print("mode="..MODE)
+print("fifo_len="..FIFO)
+print("bitrate="..BITRATE)
+print("data_bitrate="..DBITRATE)
+print(string.format("frame_id=0x%X",ID))
+print("extended="..EXT)
+print("remote="..REMOTE)
+print("tx_len="..string.len(TX))
+print("tx_hex={tx_hex}")
+for i=1,COUNT,1 do
+ can_bus("send",EXT,REMOTE,ID,TX)
+ if INTERVAL>0 and i<COUNT then delayms(INTERVAL) end
+end
+print("tx_count="..COUNT)
+print("interval_ms="..INTERVAL)
+print("H7TOOL_CAN_END")
+""".encode("ascii")
+        result = self._run_lua_script(script, "generated/can_transact.lua", b"H7TOOL_CAN_BEGIN", b"H7TOOL_CAN_END")
+        result["result"] = parse_can_transact_output(result["result"]["raw"].encode("utf-8", errors="replace"))
+        return result
+
     def run_rtt_read_script(
         self,
         control_block_address: int | None,
@@ -1994,6 +2073,65 @@ class H7ToolMcp:
             tx_data=tx_data,
             rx_length=rx_length,
             timeout_ms=timeout_ms,
+        )
+
+    def can_transact(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        mode = int(arguments.get("mode", 0))
+        fifo_len = int(arguments.get("fifo_len", 8))
+        bitrate = int(arguments.get("bitrate", 500000))
+        data_bitrate = int(arguments.get("data_bitrate", bitrate))
+        frame_id_text = arguments.get("frame_id", "0x321")
+        if isinstance(frame_id_text, str):
+            frame_id = int(frame_id_text, 0)
+        else:
+            frame_id = int(frame_id_text)
+        extended = 1 if bool(arguments.get("extended", False)) else 0
+        remote = 1 if bool(arguments.get("remote", False)) else 0
+        count = int(arguments.get("count", 1))
+        interval_ms = int(arguments.get("interval_ms", 0))
+        if mode not in {0, 1, 2}:
+            raise BridgeError("mode must be 0, 1, or 2")
+        if not 0 <= fifo_len <= 64:
+            raise BridgeError("fifo_len must be between 0 and 64")
+        if not 1000 <= bitrate <= 8000000:
+            raise BridgeError("bitrate must be between 1000 and 8000000")
+        if not 1000 <= data_bitrate <= 8000000:
+            raise BridgeError("data_bitrate must be between 1000 and 8000000")
+        if extended:
+            if not 0 <= frame_id <= 0x1FFFFFFF:
+                raise BridgeError("extended frame_id must be 0..0x1FFFFFFF")
+        elif not 0 <= frame_id <= 0x7FF:
+            raise BridgeError("standard frame_id must be 0..0x7FF")
+        if not 1 <= count <= 100:
+            raise BridgeError("count must be between 1 and 100")
+        if not 0 <= interval_ms <= 10000:
+            raise BridgeError("interval_ms must be between 0 and 10000")
+        send_text = arguments.get("data_text")
+        send_hex = arguments.get("data_hex")
+        if isinstance(send_text, str) and isinstance(send_hex, str) and send_text and send_hex:
+            raise BridgeError("Provide only one of data_text or data_hex")
+        if isinstance(send_hex, str) and send_hex:
+            tx_data = parse_hex_bytes(send_hex)
+        elif isinstance(send_text, str) and send_text:
+            tx_data = send_text.encode("utf-8")
+        else:
+            tx_data = b""
+        max_data_len = 64 if mode == 2 else 8
+        if len(tx_data) > max_data_len:
+            raise BridgeError(f"CAN data payload is limited to {max_data_len} bytes for this mode")
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError("can_transact currently requires adapter.type = h7tool_hid")
+        return self.hid_modbus.run_can_transact_script(
+            mode=mode,
+            fifo_len=fifo_len,
+            bitrate=bitrate,
+            data_bitrate=data_bitrate,
+            frame_id=frame_id,
+            extended=extended,
+            remote=remote,
+            tx_data=tx_data,
+            count=count,
+            interval_ms=interval_ms,
         )
 
     def rtt_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2274,6 +2412,8 @@ class H7ToolMcp:
             return self.target_flash_info(arguments)
         if name == "uart_transact":
             return self.uart_transact(arguments)
+        if name == "can_transact":
+            return self.can_transact(arguments)
         if name == "rtt_read":
             return self.rtt_read(arguments)
         if name == "read_option_bytes":
@@ -2521,6 +2661,27 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "can_transact",
+        "description": "Open H7-TOOL CAN/CAN-FD with bounded parameters and transmit one bounded frame payload.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "integer", "enum": [0, 1, 2], "default": 0},
+                "fifo_len": {"type": "integer", "minimum": 0, "maximum": 64, "default": 8},
+                "bitrate": {"type": "integer", "minimum": 1000, "maximum": 8000000, "default": 500000},
+                "data_bitrate": {"type": "integer", "minimum": 1000, "maximum": 8000000},
+                "frame_id": {"type": "string", "pattern": "^0x[0-9A-Fa-f]+$", "default": "0x321"},
+                "extended": {"type": "boolean", "default": False},
+                "remote": {"type": "boolean", "default": False},
+                "data_hex": {"type": "string", "description": "Hex byte payload such as '01 02 03 04'. Do not combine with data_text."},
+                "data_text": {"type": "string", "description": "UTF-8 text payload. Do not combine with data_hex."},
+                "count": {"type": "integer", "minimum": 1, "maximum": 100, "default": 1},
+                "interval_ms": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 0},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "log_tail",
         "description": "Read a bounded UART, RTT, or CAN log window through a configured command.",
         "inputSchema": {
@@ -2740,6 +2901,18 @@ def self_test(_server: H7ToolMcp) -> int:
         pass
     else:
         raise AssertionError("UART send_text/send_hex exclusivity was not enforced")
+    can = parse_can_transact_output(
+        b"H7TOOL_CAN_BEGIN\nopened=1\nmode=0\nfifo_len=8\nbitrate=500000\ndata_bitrate=500000\n"
+        b"frame_id=0x321\nextended=0\nremote=0\ntx_len=2\ntx_hex=01 02\ntx_count=1\nH7TOOL_CAN_END\n"
+    )
+    assert can["data"]["ok"] is True
+    assert can["data"]["tx_bytes"] == ["01", "02"]
+    try:
+        server.call_tool("can_transact", {"data_text": "a", "data_hex": "61"})
+    except BridgeError:
+        pass
+    else:
+        raise AssertionError("CAN data_text/data_hex exclusivity was not enforced")
     rtt = parse_rtt_read_output(
         b"H7TOOL_RTT_BEGIN\nfound=1\ncontrol_block=0x20000000\nchannel=0\nmax_up_buffers=1\n"
         b"buffer_address=0x20001000\nbuffer_size=1024\nwrite_offset=5\nread_offset=0\navailable=5\nread_len=5\n"
@@ -2888,6 +3061,18 @@ def main() -> int:
     parser.add_argument("--rtt-channel", type=int, default=0, help="RTT up-buffer channel for --rtt-read")
     parser.add_argument("--rtt-max-bytes", type=int, default=512, help="Maximum RTT bytes to read")
     parser.add_argument("--rtt-consume", action="store_true", help="Advance RTT read offset after reading")
+    parser.add_argument("--can-transact", action="store_true", help="Open CAN/CAN-FD and transmit one bounded frame payload")
+    parser.add_argument("--can-mode", type=int, default=0, choices=[0, 1, 2], help="CAN mode for --can-transact")
+    parser.add_argument("--can-fifo-len", type=int, default=8, help="CAN FIFO/data length setting for --can-transact")
+    parser.add_argument("--can-bitrate", type=int, default=500000, help="CAN nominal bitrate for --can-transact")
+    parser.add_argument("--can-data-bitrate", type=int, help="CAN-FD data bitrate for --can-transact")
+    parser.add_argument("--can-id", default="0x321", help="CAN frame ID for --can-transact")
+    parser.add_argument("--can-extended", action="store_true", help="Use extended CAN ID for --can-transact")
+    parser.add_argument("--can-remote", action="store_true", help="Send a remote frame for --can-transact")
+    parser.add_argument("--can-data-hex", help="Hex byte payload for --can-transact")
+    parser.add_argument("--can-data-text", help="UTF-8 text payload for --can-transact")
+    parser.add_argument("--can-count", type=int, default=1, help="Number of CAN frames to transmit")
+    parser.add_argument("--can-interval-ms", type=int, default=0, help="Delay between repeated CAN frames")
     args = parser.parse_args()
     if args.list_serial_ports:
         print(json.dumps(list_windows_serial_ports(), ensure_ascii=False, indent=2))
@@ -3039,6 +3224,29 @@ def main() -> int:
             if args.rtt_address:
                 rtt_args["address"] = args.rtt_address
             print(json.dumps(server.call_tool("rtt_read", rtt_args), ensure_ascii=False, indent=2))
+            return 0
+        except (BridgeError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.can_transact:
+        try:
+            can_args = {
+                "mode": args.can_mode,
+                "fifo_len": args.can_fifo_len,
+                "bitrate": args.can_bitrate,
+                "frame_id": args.can_id,
+                "extended": args.can_extended,
+                "remote": args.can_remote,
+                "count": args.can_count,
+                "interval_ms": args.can_interval_ms,
+            }
+            if args.can_data_bitrate is not None:
+                can_args["data_bitrate"] = args.can_data_bitrate
+            if args.can_data_hex is not None:
+                can_args["data_hex"] = args.can_data_hex
+            if args.can_data_text is not None:
+                can_args["data_text"] = args.can_data_text
+            print(json.dumps(server.call_tool("can_transact", can_args), ensure_ascii=False, indent=2))
             return 0
         except (BridgeError, ValueError) as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
