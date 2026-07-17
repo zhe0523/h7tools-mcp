@@ -28,7 +28,8 @@ SERVER_NAME = "h7tool-readonly-diagnostics"
 SERVER_VERSION = "0.3.0"
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
-DEFAULT_TARGET_LUA = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL" / "Programmer" / "Device" / "ST" / "STM32H7xx" / "STM32H7x_2M.lua"
+DEVICE_ROOT = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL" / "Programmer" / "Device"
+DEFAULT_TARGET_LUA = DEVICE_ROOT / "ST" / "STM32H7xx" / "STM32H7x_2M.lua"
 
 
 class BridgeError(Exception):
@@ -191,6 +192,7 @@ def parse_lua_target_profile(script_path: Path, text: str) -> dict[str, Any]:
     mcu_id = int_value("MCU_ID")
     return {
         "source": str(script_path),
+        "relative_path": _relative_device_path(script_path),
         "vendor": script_path.parts[-3] if len(script_path.parts) >= 3 else None,
         "series": script_path.parent.name,
         "device": script_path.stem,
@@ -207,6 +209,13 @@ def parse_lua_target_profile(script_path: Path, text: str) -> dict[str, Any]:
     }
 
 
+def _relative_device_path(script_path: Path) -> str | None:
+    try:
+        return script_path.resolve().relative_to(DEVICE_ROOT.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
 def _format_hex(value: int | None, width: int = 0) -> str | None:
     if value is None:
         return None
@@ -221,6 +230,129 @@ def read_target_profile(config: dict[str, Any]) -> dict[str, Any]:
         text = script_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         raise BridgeError(f"Cannot read target Lua profile {script_path}: {exc}") from exc
+    return parse_lua_target_profile(script_path, text)
+
+
+def _device_lua_files() -> list[Path]:
+    if not DEVICE_ROOT.exists():
+        raise BridgeError(f"H7-TOOL device library not found: {DEVICE_ROOT}")
+    return sorted(path for path in DEVICE_ROOT.rglob("*.lua") if path.is_file())
+
+
+def device_vendors() -> dict[str, Any]:
+    vendors: dict[str, int] = {}
+    for path in _device_lua_files():
+        try:
+            vendor = path.relative_to(DEVICE_ROOT).parts[0]
+        except (ValueError, IndexError):
+            continue
+        vendors[vendor] = vendors.get(vendor, 0) + 1
+    return {
+        "device_root": str(DEVICE_ROOT),
+        "total_lua": sum(vendors.values()),
+        "vendors": [{"vendor": name, "lua_count": count} for name, count in sorted(vendors.items())],
+    }
+
+
+def _device_summary(path: Path) -> dict[str, Any]:
+    relative = _relative_device_path(path)
+    parts = Path(relative).parts if relative is not None else ()
+    return {
+        "vendor": parts[0] if len(parts) >= 1 else None,
+        "series": parts[-2] if len(parts) >= 2 else None,
+        "device": path.stem,
+        "relative_path": relative,
+    }
+
+
+def _query_matches_device(query: str, summary: dict[str, Any], path: Path) -> bool:
+    normalized_query = re.sub(r"[^a-z0-9]+", "", query.lower())
+    haystack = " ".join(str(value) for value in summary.values() if value is not None).lower()
+    if query.strip().lower() in haystack:
+        return True
+    compact_values = [re.sub(r"[^a-z0-9]+", "", str(value).lower()) for value in summary.values() if value is not None]
+    if normalized_query and any(normalized_query in value for value in compact_values):
+        return True
+    for value in compact_values:
+        for token in re.findall(r"[a-z0-9]*x[a-z0-9]*", value):
+            pattern = "^" + re.escape(token).replace("x", "[a-z0-9]*") + "$"
+            if re.fullmatch(pattern, normalized_query):
+                return True
+    try:
+        sample = path.read_text(encoding="utf-8", errors="replace")[:8192].lower()
+    except OSError:
+        return False
+    return query.strip().lower() in sample
+
+
+def search_device_library(
+    query: str,
+    vendor: str | None = None,
+    limit: int = 50,
+    include_libraries: bool = False,
+) -> dict[str, Any]:
+    normalized_query = query.strip().lower()
+    normalized_vendor = vendor.strip().lower() if isinstance(vendor, str) and vendor.strip() else None
+    if limit < 1 or limit > 200:
+        raise BridgeError("limit must be between 1 and 200")
+    matches: list[dict[str, Any]] = []
+    for path in _device_lua_files():
+        summary = _device_summary(path)
+        if not include_libraries and summary.get("series") == "Lib":
+            continue
+        haystack = " ".join(str(value) for value in summary.values() if value is not None).lower()
+        if normalized_vendor and str(summary.get("vendor", "")).lower() != normalized_vendor:
+            continue
+        if normalized_query and not _query_matches_device(query, summary, path):
+            continue
+        matches.append(summary)
+        if len(matches) >= limit:
+            break
+    return {
+        "device_root": str(DEVICE_ROOT),
+        "query": query,
+        "vendor": vendor,
+        "limit": limit,
+        "include_libraries": include_libraries,
+        "matches": matches,
+        "returned": len(matches),
+    }
+
+
+def resolve_device_script(arguments: dict[str, Any]) -> Path:
+    relative_path = arguments.get("relative_path")
+    if isinstance(relative_path, str) and relative_path.strip():
+        candidate = (DEVICE_ROOT / relative_path).resolve()
+        try:
+            candidate.relative_to(DEVICE_ROOT.resolve())
+        except ValueError as exc:
+            raise BridgeError("relative_path must stay inside the H7-TOOL device library") from exc
+        if candidate.suffix.lower() != ".lua":
+            raise BridgeError("relative_path must point to a .lua file")
+        if not candidate.exists():
+            raise BridgeError(f"Device Lua file not found: {relative_path}")
+        return candidate
+    vendor = arguments.get("vendor")
+    series = arguments.get("series")
+    device = arguments.get("device")
+    if all(isinstance(value, str) and value.strip() for value in (vendor, series, device)):
+        candidate = (DEVICE_ROOT / str(vendor) / str(series) / f"{device}.lua").resolve()
+        try:
+            candidate.relative_to(DEVICE_ROOT.resolve())
+        except ValueError as exc:
+            raise BridgeError("device path must stay inside the H7-TOOL device library") from exc
+        if not candidate.exists():
+            raise BridgeError(f"Device Lua file not found: {vendor}/{series}/{device}.lua")
+        return candidate
+    raise BridgeError("Provide relative_path, or vendor + series + device")
+
+
+def read_device_profile(arguments: dict[str, Any]) -> dict[str, Any]:
+    script_path = resolve_device_script(arguments)
+    try:
+        text = script_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise BridgeError(f"Cannot read device Lua profile {script_path}: {exc}") from exc
     return parse_lua_target_profile(script_path, text)
 
 
@@ -1147,6 +1279,17 @@ class H7ToolMcp:
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "bridge_status":
             return self.status()
+        if name == "device_vendors":
+            return device_vendors()
+        if name == "device_search":
+            return search_device_library(
+                str(arguments.get("query", "")),
+                arguments.get("vendor") if isinstance(arguments.get("vendor"), str) else None,
+                int(arguments.get("limit", 50)),
+                bool(arguments.get("include_libraries", False)),
+            )
+        if name == "device_profile":
+            return read_device_profile(arguments)
         if name == "tool_status":
             if self.adapter.kind in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
                 return self.read_modbus_status()
@@ -1203,6 +1346,39 @@ TOOLS: list[dict[str, Any]] = [
         "name": "bridge_status",
         "description": "Show bridge configuration, available serial ports/H7-TOOL HID interfaces, and the read-only safety policy. Does not contact H7-TOOL.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "device_vendors",
+        "description": "List local H7-TOOL Programmer device-library vendors and Lua script counts. Pure filesystem indexing; no hardware access.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "device_search",
+        "description": "Search local H7-TOOL Programmer device Lua scripts by keyword and optional vendor. Pure filesystem indexing; no hardware access.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "default": ""},
+                "vendor": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+                "include_libraries": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "device_profile",
+        "description": "Parse one local H7-TOOL device Lua profile and return metadata such as interface, IDCODE, UID address, memory base addresses, includes, and FLM algorithms.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "vendor": {"type": "string"},
+                "series": {"type": "string"},
+                "device": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
     },
     {
         "name": "tool_status",
@@ -1391,6 +1567,15 @@ def self_test(_server: H7ToolMcp) -> int:
     assert profile["expected_idcode"] == "0x6BA02477"
     assert profile["uid_address"] == "0x1FF1E800"
     assert profile["algorithm_ram_size_bytes"] == 128 * 1024
+    vendors = device_vendors()
+    assert vendors["total_lua"] > 1000
+    assert any(item["vendor"] == "ST" for item in vendors["vendors"])
+    search = search_device_library("STM32H7x_2M", vendor="ST", limit=20)
+    assert any(item["relative_path"] == "ST/STM32H7xx/STM32H7x_2M.lua" for item in search["matches"])
+    fuzzy_search = search_device_library("STM32H743", vendor="ST", limit=10)
+    assert any(item["relative_path"] == "ST/STM32H7xx/STM32H7x_2M.lua" for item in fuzzy_search["matches"])
+    device_profile = read_device_profile({"relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"})
+    assert device_profile["expected_idcode"] == "0x6BA02477"
     try:
         server.call_tool("read_memory", {"address": "0x20000000", "length": 4096})
     except BridgeError:
@@ -1412,6 +1597,11 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=Path(os.environ.get("H7TOOL_MCP_CONFIG", DEFAULT_CONFIG_PATH)))
     parser.add_argument("--list-serial-ports", action="store_true", help="List Windows serial devices and exit")
     parser.add_argument("--list-hid-devices", action="store_true", help="List matching H7-TOOL USB HID interfaces and exit")
+    parser.add_argument("--device-vendors", action="store_true", help="List local H7-TOOL device-library vendors and Lua counts")
+    parser.add_argument("--device-search", metavar="QUERY", help="Search local H7-TOOL device Lua scripts")
+    parser.add_argument("--device-vendor", metavar="VENDOR", help="Restrict --device-search to one vendor")
+    parser.add_argument("--include-libraries", action="store_true", help="Include shared Lib scripts in --device-search results")
+    parser.add_argument("--device-profile", metavar="RELATIVE_PATH", help="Parse one local H7-TOOL device Lua profile")
     parser.add_argument("--self-test", action="store_true", help="Test MCP logic using only the built-in mock adapter")
     parser.add_argument("--probe-h7tool", action="store_true", help="Run the configured read-only tool_status probe and print JSON")
     parser.add_argument("--health-summary", action="store_true", help="Run the configured conservative read-only health assessment and print JSON")
@@ -1426,6 +1616,21 @@ def main() -> int:
         return 0
     if args.list_hid_devices:
         print(json.dumps(list_h7tool_hid_devices(), ensure_ascii=False, indent=2))
+        return 0
+    if args.device_vendors:
+        print(json.dumps(device_vendors(), ensure_ascii=False, indent=2))
+        return 0
+    if args.device_search is not None:
+        print(
+            json.dumps(
+                search_device_library(args.device_search, args.device_vendor, include_libraries=args.include_libraries),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.device_profile is not None:
+        print(json.dumps(read_device_profile({"relative_path": args.device_profile}), ensure_ascii=False, indent=2))
         return 0
     config = load_config(args.config)
     server = H7ToolMcp(config, args.config)
