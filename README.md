@@ -14,6 +14,7 @@ The public documentation only covers installation and usage. Product-internal co
 - Searches bundled H7-TOOL Lua examples and bus helper scripts so the AI can inspect original peripheral usage.
 - Provides public safety and style rules for AI-authored H7-TOOL Lua helper scripts.
 - Provides an offline Lua draft workspace to create, list, read, and validate drafts without executing them.
+- Reviews Lua drafts statically and can run validated drafts only after explicit execution confirmation.
 - Provides a dangerous-action policy gate for future programming, erase, unlock, protection, power, and raw-Lua actions.
 - Parses device profiles for interface type, expected ID, UID location, memory ranges, included libraries, and algorithm entries.
 - Summarizes profile capabilities so the AI can understand what a chip profile appears to support.
@@ -86,6 +87,7 @@ python h7tool_mcp.py --device-search STM32H743 --device-vendor ST
 python h7tool_mcp.py --lua-example-search BH1750 --lua-example-interface i2c
 python h7tool_mcp.py --lua-authoring-rules
 python h7tool_mcp.py --lua-draft-list
+python h7tool_mcp.py --lua-draft-review example.lua
 python h7tool_mcp.py --dangerous-action-policy
 python h7tool_mcp.py --device-profile ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --lua-health
@@ -213,6 +215,10 @@ Use h7tool lua_draft_create to draft an I2C register-read Lua helper, then valid
 ```
 
 ```text
+Use h7tool lua_draft_review to classify a Lua draft as non-destructive or dangerous before running it.
+```
+
+```text
 Use h7tool dangerous_action_policy to check whether programming, erase, unlock, protection, and similar dangerous actions are currently allowed.
 ```
 
@@ -267,6 +273,8 @@ Good workflow:
 - `lua_draft_list`
 - `lua_draft_read`
 - `lua_draft_validate`
+- `lua_draft_review`
+- `lua_draft_run`
 - `dangerous_action_policy`
 - `dangerous_action_explain`
 - `device_profile`

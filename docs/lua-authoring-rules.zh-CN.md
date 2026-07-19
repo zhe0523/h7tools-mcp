@@ -18,8 +18,18 @@ AI 可以先把 Lua 写成离线草稿，而不是直接执行：
 - `lua_draft_list`：列出草稿。
 - `lua_draft_read`：读取草稿并返回校验结果。
 - `lua_draft_validate`：校验草稿文本或已保存草稿。
+- `lua_draft_review`：静态审查草稿，归类为非破坏性或危险动作。
+- `lua_draft_run`：在显式确认后运行已保存草稿。
 
-草稿保存在本地 `workspace/lua_drafts/`，该目录不提交到 git。草稿工具不会执行 Lua，也不会访问硬件。
+草稿保存在本地 `workspace/lua_drafts/`，该目录不提交到 git。创建、列表、读取、校验、审查工具不会执行 Lua，也不会访问硬件。
+
+运行草稿时必须满足：
+
+- 只能运行 `workspace/lua_drafts/` 里的 `.lua` 文件。
+- 每次请求必须传 `execute=true`。
+- 草稿必须通过 `lua_draft_validate`。
+- 草稿必须包含 `H7TOOL_USER_BEGIN` 和 `H7TOOL_USER_END` 输出标记。
+- 如果 `lua_draft_review` 判断为危险动作，还必须通过 `dangerous_action_policy` 的配置和确认短语；配置里需要同时允许 `raw_lua` 和对应的具体危险级别。
 
 ## 危险动作门禁
 

@@ -1005,6 +1005,61 @@ def lua_draft_validate(arguments: dict[str, Any]) -> dict[str, Any]:
     raise BridgeError("Provide either content or name")
 
 
+def review_lua_draft_text(content: str) -> dict[str, Any]:
+    validation = validate_lua_draft_text(content)
+    lowered = content.lower()
+    reasons: list[str] = []
+    levels: list[str] = []
+    if any("erase" in error for error in validation["errors"]) or re.search(r"\berase[_a-z0-9]*\s*\(", lowered):
+        levels.append("erase")
+        reasons.append("Script appears to call an erase operation.")
+    if re.search(r"\b(?:program|download|write_flash|pg_write|pg_program)[_a-z0-9]*\s*\(", lowered):
+        levels.append("program")
+        reasons.append("Script appears to program or write target nonvolatile memory.")
+    if re.search(r"\b(?:unlock|unprotect|remove_protect|write_ob|ob_|option)[_a-z0-9]*", lowered):
+        levels.append("protection")
+        reasons.append("Script appears to change protection, option bytes, or lock state.")
+    if re.search(r"\b(?:poweroff|power_on|power_off|target_power|reset_target)[_a-z0-9]*\s*\(", lowered):
+        levels.append("power")
+        reasons.append("Script appears to control target power or reset.")
+    write_like = re.search(r"\b(?:write|send)\b", lowered) or re.search(r"\b(?:i2c_bus|spi_bus|uart_\w+|can_bus)\s*\(\s*[\"']send", lowered)
+    read_like = re.search(r"\b(?:read|recive|receive)\b", lowered)
+    if write_like and not read_like and not any(level in levels for level in ("erase", "program", "protection")):
+        levels.append("write")
+        reasons.append("Script appears to perform a write/send operation without an obvious readback.")
+    if not levels:
+        levels.append("read")
+        reasons.append("No obvious destructive operation was detected by static review.")
+    unique_levels = [level for index, level in enumerate(levels) if level not in levels[:index]]
+    dangerous_levels = [level for level in unique_levels if level in DANGEROUS_ACTION_LEVELS and level != "raw_lua"]
+    return {
+        "validation": validation,
+        "classification": "dangerous" if dangerous_levels else "non_destructive",
+        "levels": unique_levels,
+        "dangerous_levels": dangerous_levels,
+        "requires_dangerous_confirmation": bool(dangerous_levels),
+        "reasons": reasons,
+        "notes": [
+            "This is a static heuristic review, not a proof of safety.",
+            "lua_draft_run still requires execute=true for every run.",
+        ],
+    }
+
+
+def lua_draft_review(arguments: dict[str, Any]) -> dict[str, Any]:
+    content = arguments.get("content")
+    name = arguments.get("name")
+    if isinstance(content, str) and content:
+        return {"source": "content", "review": review_lua_draft_text(content)}
+    if isinstance(name, str) and name.strip():
+        path = _lua_draft_path(name)
+        if not path.exists():
+            raise BridgeError(f"Lua draft not found: {path.name}")
+        draft = path.read_text(encoding="utf-8", errors="replace")
+        return {"source": path.name, "review": review_lua_draft_text(draft)}
+    raise BridgeError("Provide either content or name")
+
+
 DANGEROUS_ACTION_LEVELS: dict[str, dict[str, Any]] = {
     "write": {
         "label": "write",
@@ -3051,6 +3106,37 @@ class H7ToolMcp:
         status = self.read_modbus_status()
         return {"transport": status["transport"], "data": summarize_h7tool_health(status["data"])}
 
+    def lua_draft_run(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        name = str(arguments.get("name", ""))
+        execute = bool(arguments.get("execute", False))
+        confirmation = str(arguments.get("confirmation", ""))
+        if not execute:
+            raise BridgeError("lua_draft_run requires execute=true")
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError("lua_draft_run requires adapter.type = h7tool_hid")
+        path = _lua_draft_path(name)
+        if not path.exists():
+            raise BridgeError(f"Lua draft not found: {path.name}")
+        content = path.read_text(encoding="utf-8", errors="replace")
+        review = review_lua_draft_text(content)
+        validation = review["validation"]
+        errors = validation.get("errors", [])
+        if not isinstance(errors, list):
+            errors = []
+        blocking_errors = [str(error) for error in errors if not str(error).startswith("potentially dangerous operations detected")]
+        if blocking_errors:
+            raise BridgeError("Lua draft validation failed: " + "; ".join(blocking_errors))
+        dangerous_levels = review.get("dangerous_levels", [])
+        if isinstance(dangerous_levels, list) and dangerous_levels:
+            require_dangerous_confirmation(self.config, "raw_lua", confirmation)
+            for level in dangerous_levels:
+                require_dangerous_confirmation(self.config, str(level), confirmation)
+        script = content.encode("utf-8")
+        result = self.hid_modbus._run_lua_script(script, f"workspace/lua_drafts/{path.name}", b"H7TOOL_USER_BEGIN", b"H7TOOL_USER_END")
+        result["review"] = review
+        result["draft"] = {"name": path.name, "relative_path": f"workspace/lua_drafts/{path.name}"}
+        return result
+
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "bridge_status":
             return self.status()
@@ -3080,6 +3166,10 @@ class H7ToolMcp:
             return lua_draft_read(arguments)
         if name == "lua_draft_validate":
             return lua_draft_validate(arguments)
+        if name == "lua_draft_review":
+            return lua_draft_review(arguments)
+        if name == "lua_draft_run":
+            return self.lua_draft_run(arguments)
         if name == "dangerous_action_policy":
             return dangerous_action_policy(self.config)
         if name == "dangerous_action_explain":
@@ -3239,6 +3329,32 @@ TOOLS: list[dict[str, Any]] = [
                 "name": {"type": "string", "description": "Saved draft name to validate."},
                 "content": {"type": "string", "description": "Unsaved Lua text to validate."},
             },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "lua_draft_review",
+        "description": "Statically review a Lua draft or text and classify it as non-destructive or dangerous. Does not execute Lua or contact hardware.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Saved draft name to review."},
+                "content": {"type": "string", "description": "Unsaved Lua text to review."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "lua_draft_run",
+        "description": "Run one saved Lua draft through H7-TOOL HID after validation, review, and explicit execute=true. Dangerous drafts also require the configured confirmation phrase.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Saved draft name under workspace/lua_drafts."},
+                "execute": {"type": "boolean", "description": "Must be true for every run."},
+                "confirmation": {"type": "string", "description": "Required only when review detects dangerous levels allowed by dangerous_action_policy."},
+            },
+            "required": ["name", "execute"],
             "additionalProperties": False,
         },
     },
@@ -3797,6 +3913,16 @@ def self_test(_server: H7ToolMcp) -> int:
     assert lua_draft_read({"name": "self_test.lua"})["content"] == draft_content
     dangerous = lua_draft_validate({"content": 'print("BEGIN")\nerase_chip()\nprint("END")\n'})
     assert dangerous["validation"]["ok"] is False
+    safe_review = lua_draft_review({"content": draft_content})
+    assert safe_review["review"]["classification"] == "non_destructive"
+    dangerous_review = lua_draft_review({"content": 'print("H7TOOL_USER_BEGIN")\nerase_chip()\nprint("ok=0")\nprint("H7TOOL_USER_END")\n'})
+    assert dangerous_review["review"]["requires_dangerous_confirmation"] is True
+    try:
+        server.call_tool("lua_draft_run", {"name": "self_test.lua", "execute": False})
+    except BridgeError:
+        pass
+    else:
+        raise AssertionError("lua_draft_run accepted missing execute=true")
     try:
         _lua_draft_path("self_test.lua").unlink()
     except OSError:
@@ -3911,6 +4037,10 @@ def main() -> int:
     parser.add_argument("--lua-draft-list", action="store_true", help="List offline Lua drafts")
     parser.add_argument("--lua-draft-read", metavar="NAME", help="Read one offline Lua draft")
     parser.add_argument("--lua-draft-validate", metavar="NAME", help="Validate one offline Lua draft")
+    parser.add_argument("--lua-draft-review", metavar="NAME", help="Statically review one offline Lua draft")
+    parser.add_argument("--lua-draft-run", metavar="NAME", help="Run one offline Lua draft through H7-TOOL HID after validation and explicit --execute")
+    parser.add_argument("--execute", action="store_true", help="Required with --lua-draft-run")
+    parser.add_argument("--confirmation", default="", help="Confirmation phrase for dangerous actions")
     parser.add_argument("--dangerous-action-policy", action="store_true", help="Show dangerous action gate policy")
     parser.add_argument("--dangerous-action-explain", choices=["write", "erase", "program", "protection", "power", "raw_lua"], help="Explain one dangerous action level")
     parser.add_argument("--device-profile", metavar="RELATIVE_PATH", help="Parse one local H7-TOOL device Lua profile")
@@ -4010,14 +4140,33 @@ def main() -> int:
         print(json.dumps(lua_authoring_rules(), ensure_ascii=False, indent=2))
         return 0
     if args.lua_draft_list:
-        print(json.dumps(lua_draft_list(), ensure_ascii=False, indent=2))
-        return 0
+        try:
+            print(json.dumps(lua_draft_list(), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
     if args.lua_draft_read is not None:
-        print(json.dumps(lua_draft_read({"name": args.lua_draft_read}), ensure_ascii=False, indent=2))
-        return 0
+        try:
+            print(json.dumps(lua_draft_read({"name": args.lua_draft_read}), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
     if args.lua_draft_validate is not None:
-        print(json.dumps(lua_draft_validate({"name": args.lua_draft_validate}), ensure_ascii=False, indent=2))
-        return 0
+        try:
+            print(json.dumps(lua_draft_validate({"name": args.lua_draft_validate}), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.lua_draft_review is not None:
+        try:
+            print(json.dumps(lua_draft_review({"name": args.lua_draft_review}), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
     if args.device_profile is not None:
         print(json.dumps(read_device_profile({"relative_path": args.device_profile}), ensure_ascii=False, indent=2))
         return 0
@@ -4034,6 +4183,22 @@ def main() -> int:
     if args.dangerous_action_explain is not None:
         print(json.dumps(dangerous_action_explain({"level": args.dangerous_action_explain}), ensure_ascii=False, indent=2))
         return 0
+    if args.lua_draft_run is not None:
+        try:
+            print(
+                json.dumps(
+                    server.call_tool(
+                        "lua_draft_run",
+                        {"name": args.lua_draft_run, "execute": args.execute, "confirmation": args.confirmation},
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
     if args.probe_h7tool:
         try:
             print(json.dumps(server.call_tool("tool_status", {}), ensure_ascii=False, indent=2))
