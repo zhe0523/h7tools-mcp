@@ -13,9 +13,12 @@ The public documentation only covers installation and usage. Product-internal co
 - Searches the local H7-TOOL device Lua library by vendor, series, or chip name.
 - Searches bundled H7-TOOL Lua examples and bus helper scripts so the AI can inspect original peripheral usage.
 - Provides public safety and style rules for AI-authored H7-TOOL Lua helper scripts.
+- Provides bounded Lua debugging templates and an AI workflow for UART, Modbus RTU, I2C, SPI, and CAN experiments.
 - Provides an offline Lua draft workspace to create, list, read, and validate drafts without executing them.
 - Reviews Lua drafts statically and can run validated drafts only after explicit execution confirmation.
-- Provides a dangerous-action policy gate for future programming, erase, unlock, protection, power, and raw-Lua actions.
+- Provides a dangerous-action policy gate for future programming, erase, unlock, protection, power, persistent-storage, and register-state changes.
+- Provides programming preflight checks for firmware file hash, size, start address, target profile, flash metadata, and dangerous-action policy. It does not program hardware.
+- Generates redacted Markdown diagnostic reports for forum posts, issues, handoff, or session archiving.
 - Parses device profiles for interface type, expected ID, UID location, memory ranges, included libraries, and algorithm entries.
 - Summarizes profile capabilities so the AI can understand what a chip profile appears to support.
 - Probes a connected STM32H7 target and combines live results with the selected local profile.
@@ -86,10 +89,16 @@ python h7tool_mcp.py --device-vendors
 python h7tool_mcp.py --device-search STM32H743 --device-vendor ST
 python h7tool_mcp.py --lua-example-search BH1750 --lua-example-interface i2c
 python h7tool_mcp.py --lua-authoring-rules
+python h7tool_mcp.py --lua-template-library
+python h7tool_mcp.py --lua-template-library spi_jedec_id
+python h7tool_mcp.py --lua-debug-workflow "read SPI Flash JEDEC ID" --lua-debug-interface spi
 python h7tool_mcp.py --lua-draft-list
 python h7tool_mcp.py --lua-draft-review example.lua
 python h7tool_mcp.py --dangerous-action-policy
+python h7tool_mcp.py --dangerous-action-plan "program firmware" --dangerous-action-level program
 python h7tool_mcp.py --device-profile ST/STM32H7xx/STM32H7x_2M.lua
+python h7tool_mcp.py --programming-preflight firmware.bin --device-profile ST/STM32H7xx/STM32H7x_2M.lua --programming-address 0x08000000
+python h7tool_mcp.py --diagnostic-report session-summary --device-profile ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --lua-health
 python h7tool_mcp.py --target-identity ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --target-summary ST/STM32H7xx/STM32H7x_2M.lua
@@ -98,7 +107,7 @@ python h7tool_mcp.py --target-flash-info ST/STM32H7xx/STM32H7x_2M.lua
 
 `config.json` is intentionally ignored by git because it contains local device settings.
 
-Dangerous actions are disabled by default. Future programming, erase, unlock, protection, power-control, and raw-Lua tools must check `dangerous_actions` in `config.json` and require the matching confirmation phrase on each request.
+Routine debugging actions are available by default, including device queries, target reads, bus transactions, RTT reads, and non-destructive Lua drafts. Dangerous actions are disabled by default. Programming, erase, unlock, protection changes, power-control, persistent storage changes, and register-state changes must check `dangerous_actions` in `config.json` and require the matching confirmation phrase on each request.
 
 ## Start The MCP Server
 
@@ -258,9 +267,12 @@ Good workflow:
 
 1. Ask the AI to check `bridge_status`.
 2. Ask it to search or inspect the target device profile.
-3. Ask it to run `lua_health` or `health_summary`.
-4. Ask it to run `target_summary`.
-5. Ask for focused memory, option-byte, RTT, or peripheral transactions only after the target profile is selected.
+3. When Lua-assisted debugging is useful, ask it to call `lua_debug_workflow` and `lua_template_library` to create a small draft.
+4. Ask it to call `lua_draft_review`; non-destructive debugging drafts can be run with `lua_draft_run` and `execute=true`.
+5. Ask it to run `lua_health`, `health_summary`, or `target_summary` for hardware state checks.
+6. Ask for focused memory, option-byte, RTT, or peripheral transactions only after the target profile is selected.
+7. Before programming, erase, protection, or other dangerous actions, ask it to call `programming_preflight` or `dangerous_action_plan`.
+8. At the end of a session, ask it to call `diagnostic_report` for a redacted Markdown summary.
 
 ## Available MCP Tools
 
@@ -269,6 +281,8 @@ Good workflow:
 - `device_search`
 - `lua_example_search`
 - `lua_authoring_rules`
+- `lua_template_library`
+- `lua_debug_workflow`
 - `lua_draft_create`
 - `lua_draft_list`
 - `lua_draft_read`
@@ -277,6 +291,9 @@ Good workflow:
 - `lua_draft_run`
 - `dangerous_action_policy`
 - `dangerous_action_explain`
+- `dangerous_action_plan`
+- `programming_preflight`
+- `diagnostic_report`
 - `device_profile`
 - `device_capabilities`
 - `tool_status`

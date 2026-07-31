@@ -19,7 +19,7 @@ AI 可以先把 Lua 写成离线草稿，而不是直接执行：
 - `lua_draft_read`：读取草稿并返回校验结果。
 - `lua_draft_validate`：校验草稿文本或已保存草稿。
 - `lua_draft_review`：静态审查草稿，归类为非破坏性或危险动作。
-- `lua_draft_run`：在显式确认后运行已保存草稿。
+- `lua_draft_run`：在 `execute=true` 后运行已保存草稿；非破坏性调试草稿不需要危险动作确认。
 
 草稿保存在本地 `workspace/lua_drafts/`，该目录不提交到 git。创建、列表、读取、校验、审查工具不会执行 Lua，也不会访问硬件。
 
@@ -28,12 +28,12 @@ AI 可以先把 Lua 写成离线草稿，而不是直接执行：
 - 只能运行 `workspace/lua_drafts/` 里的 `.lua` 文件。
 - 每次请求必须传 `execute=true`。
 - 草稿必须通过 `lua_draft_validate`。
-- 草稿必须包含 `H7TOOL_USER_BEGIN` 和 `H7TOOL_USER_END` 输出标记。
-- 如果 `lua_draft_review` 判断为危险动作，还必须通过 `dangerous_action_policy` 的配置和确认短语；配置里需要同时允许 `raw_lua` 和对应的具体危险级别。
+- 建议草稿包含 `H7TOOL_USER_BEGIN` 和 `H7TOOL_USER_END` 输出标记；包含标记时结果更容易结构化解析。临时调试脚本没有标记时也可以运行，并返回原始输出。
+- 如果 `lua_draft_review` 判断为危险动作，还必须通过 `dangerous_action_policy` 的配置和确认短语；配置里只需要允许对应的具体危险级别，例如 `erase`、`program`、`protection`、`power` 或 `write`。
 
 ## 危险动作门禁
 
-烧录、擦除、解锁、改保护、供电控制、执行自定义 Lua 等动作属于危险动作。相关功能接入时必须先检查 `dangerous_action_policy`：
+自定义 Lua 本身是调试能力，不默认视为危险动作。烧录、擦除、解锁、改保护、供电控制、改持久存储或寄存器状态等动作属于危险动作。相关功能接入时必须先检查 `dangerous_action_policy`：
 
 - `dangerous_actions.enabled` 必须为 `true`。
 - 动作级别必须出现在 `dangerous_actions.allowed_levels` 中。
@@ -46,7 +46,7 @@ AI 可以先把 Lua 写成离线草稿，而不是直接执行：
 - `program`：烧录目标或外部存储器。
 - `protection`：改 Option Byte、读保护、安全锁等。
 - `power`：目标供电、复位、电源时序。
-- `raw_lua`：执行自定义 Lua 脚本。
+- `raw_lua`：自定义 Lua 脚本能力的说明级别；Lua 草稿执行不需要把它作为第二重授权。
 
 ## 输出格式
 
@@ -63,7 +63,7 @@ print("H7TOOL_USER_END")
 
 规则：
 
-- 必须有唯一的 BEGIN/END 标记。
+- 建议有唯一的 BEGIN/END 标记。
 - 标记之间使用 `key=value` 输出。
 - 十六进制字节使用大写两位格式，并用空格分隔。
 - 输出中要有足够字段判断操作是否成功。

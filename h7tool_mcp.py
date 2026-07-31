@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import math
 import os
@@ -1022,11 +1023,14 @@ def review_lua_draft_text(content: str) -> dict[str, Any]:
     if re.search(r"\b(?:poweroff|power_on|power_off|target_power|reset_target)[_a-z0-9]*\s*\(", lowered):
         levels.append("power")
         reasons.append("Script appears to control target power or reset.")
-    write_like = re.search(r"\b(?:write|send)\b", lowered) or re.search(r"\b(?:i2c_bus|spi_bus|uart_\w+|can_bus)\s*\(\s*[\"']send", lowered)
+    state_write_like = re.search(r"\b(?:write_reg|write_register|write_eeprom|write_mem|poke)\b", lowered)
+    state_write_like = state_write_like or (
+        "write" in lowered and any(keyword in lowered for keyword in ("eeprom", "option", "flash", "register", "reg_addr"))
+    )
     read_like = re.search(r"\b(?:read|recive|receive)\b", lowered)
-    if write_like and not read_like and not any(level in levels for level in ("erase", "program", "protection")):
+    if state_write_like and not read_like and not any(level in levels for level in ("erase", "program", "protection")):
         levels.append("write")
-        reasons.append("Script appears to perform a write/send operation without an obvious readback.")
+        reasons.append("Script appears to modify persistent memory or hardware registers without an obvious readback.")
     if not levels:
         levels.append("read")
         reasons.append("No obvious destructive operation was detected by static review.")
@@ -1042,6 +1046,7 @@ def review_lua_draft_text(content: str) -> dict[str, Any]:
         "notes": [
             "This is a static heuristic review, not a proof of safety.",
             "lua_draft_run still requires execute=true for every run.",
+            "Ordinary UART/CAN/I2C/SPI send transactions are treated as development debugging unless the script also looks like it modifies persistent memory, protection, power, or programming state.",
         ],
     }
 
@@ -1112,7 +1117,9 @@ def dangerous_action_policy(config: dict[str, Any]) -> dict[str, Any]:
         "notes": [
             "Dangerous actions are denied unless enabled in config.json.",
             "A matching confirmation phrase is required per request.",
-            "This policy is a gate for future write/erase/program/protection/power/raw_lua tools; it does not execute anything by itself.",
+            "Custom Lua debugging is allowed without this gate when static review does not detect dangerous operations.",
+            "For Lua drafts, allow the concrete dangerous level such as erase/program/protection/power/write; raw_lua is informational and is not required as a second approval.",
+            "This policy is a gate for write/erase/program/protection/power actions; it does not execute anything by itself.",
         ],
     }
 
@@ -1141,6 +1148,468 @@ def require_dangerous_confirmation(
     if confirmation != policy["confirmation_phrase"]:
         raise BridgeError("confirmation phrase did not match the configured dangerous action policy")
     return {"allowed": True, "level": level}
+
+
+def _parse_hex_address(value: Any, label: str = "address") -> int:
+    text = str(value).strip()
+    if not text.startswith("0x"):
+        raise BridgeError(f"{label} must be hexadecimal, for example 0x08000000")
+    try:
+        return int(text, 16)
+    except ValueError as exc:
+        raise BridgeError(f"{label} must be hexadecimal, for example 0x08000000") from exc
+
+
+def _workspace_relative(path: Path) -> str:
+    base = Path(__file__).resolve().parent
+    try:
+        return path.resolve().relative_to(base).as_posix()
+    except ValueError:
+        return path.name
+
+
+def _firmware_path(path_text: str) -> Path:
+    if not path_text.strip():
+        raise BridgeError("firmware_path is required")
+    path = Path(path_text)
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    return path
+
+
+def _analyze_intel_hex(path: Path) -> dict[str, Any]:
+    min_address: int | None = None
+    max_address: int | None = None
+    data_bytes = 0
+    upper_linear = 0
+    upper_segment = 0
+    line_count = 0
+    try:
+        lines = path.read_text(encoding="ascii", errors="strict").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BridgeError(f"Cannot read Intel HEX firmware: {exc}") from exc
+    for line in lines:
+        line_count += 1
+        text = line.strip()
+        if not text:
+            continue
+        if not text.startswith(":") or len(text) < 11:
+            raise BridgeError(f"Invalid Intel HEX record at line {line_count}")
+        try:
+            count = int(text[1:3], 16)
+            offset = int(text[3:7], 16)
+            record_type = int(text[7:9], 16)
+            data = bytes.fromhex(text[9 : 9 + count * 2])
+        except ValueError as exc:
+            raise BridgeError(f"Invalid Intel HEX record at line {line_count}") from exc
+        if record_type == 0x00:
+            base = upper_linear or upper_segment
+            address = base + offset
+            if count:
+                min_address = address if min_address is None else min(min_address, address)
+                max_address = address + count - 1 if max_address is None else max(max_address, address + count - 1)
+                data_bytes += count
+        elif record_type == 0x01:
+            break
+        elif record_type == 0x02 and len(data) == 2:
+            upper_segment = int.from_bytes(data, "big") << 4
+            upper_linear = 0
+        elif record_type == 0x04 and len(data) == 2:
+            upper_linear = int.from_bytes(data, "big") << 16
+            upper_segment = 0
+    return {
+        "format": "intel_hex",
+        "data_bytes": data_bytes,
+        "address_min": _format_hex(min_address, 8),
+        "address_max": _format_hex(max_address, 8),
+    }
+
+
+def analyze_firmware_file(path: Path, start_address: int | None) -> dict[str, Any]:
+    if not path.exists():
+        raise BridgeError(f"Firmware file not found: {path}")
+    if not path.is_file():
+        raise BridgeError(f"Firmware path is not a file: {path}")
+    try:
+        stat = path.stat()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            first16 = handle.read(16)
+            digest.update(first16)
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError as exc:
+        raise BridgeError(f"Cannot read firmware file: {exc}") from exc
+    suffix = path.suffix.lower()
+    metadata: dict[str, Any] = {"format": "raw_binary" if suffix == ".bin" else suffix.lstrip(".") or "unknown"}
+    if suffix in {".hex", ".ihex"}:
+        metadata = _analyze_intel_hex(path)
+    elif suffix == ".bin" and start_address is not None:
+        metadata["address_min"] = _format_hex(start_address, 8)
+        metadata["address_max"] = _format_hex(start_address + stat.st_size - 1, 8) if stat.st_size else _format_hex(start_address, 8)
+        metadata["data_bytes"] = stat.st_size
+    else:
+        metadata["data_bytes"] = stat.st_size
+    return {
+        "path": str(path),
+        "name": path.name,
+        "extension": suffix,
+        "size_bytes": stat.st_size,
+        "sha256": digest.hexdigest(),
+        "first16_hex": " ".join(f"{byte:02X}" for byte in first16),
+        "image": metadata,
+    }
+
+
+def programming_preflight(arguments: dict[str, Any], config: dict[str, Any], target_summary_result: dict[str, Any] | None = None) -> dict[str, Any]:
+    profile = read_selected_target_profile(config, arguments)
+    default_address = profile.get("flash_address")
+    start_address = _parse_hex_address(arguments["address"], "address") if isinstance(arguments.get("address"), str) and arguments.get("address") else None
+    if start_address is None and isinstance(default_address, str):
+        start_address = int(default_address, 16)
+    firmware = analyze_firmware_file(_firmware_path(str(arguments.get("firmware_path", ""))), start_address)
+    image = firmware.get("image", {})
+    image_bytes = image.get("data_bytes", firmware["size_bytes"]) if isinstance(image, dict) else firmware["size_bytes"]
+    profile_flash_bytes = primary_flash_algorithm_size(profile)
+    policy = dangerous_action_policy(config)
+    errors: list[str] = []
+    warnings: list[str] = []
+    if firmware["extension"] not in {".bin", ".hex", ".ihex", ".elf", ".axf"}:
+        warnings.append("Firmware extension is not a common MCU image type; verify the file before programming.")
+    if image_bytes == 0:
+        errors.append("Firmware image contains no data bytes.")
+    if profile_flash_bytes is None:
+        warnings.append("Selected profile does not expose primary flash size metadata.")
+    elif isinstance(image_bytes, int) and image_bytes > profile_flash_bytes:
+        errors.append("Firmware image is larger than the selected profile primary flash algorithm size.")
+    if isinstance(image, dict) and image.get("address_min") and profile.get("flash_address"):
+        image_min = int(str(image["address_min"]), 16)
+        flash_base = int(str(profile["flash_address"]), 16)
+        if image_min < flash_base:
+            warnings.append("Firmware image starts below the selected profile flash base.")
+    if not policy["enabled"] or "program" not in policy["allowed_levels"]:
+        warnings.append("Programming is not currently allowed by dangerous_actions; this preflight did not execute anything.")
+    result: dict[str, Any] = {
+        "ok": not errors,
+        "mode": "preflight_only",
+        "executed": False,
+        "firmware": firmware,
+        "profile": {
+            "relative_path": profile.get("relative_path"),
+            "vendor": profile.get("vendor"),
+            "series": profile.get("series"),
+            "device": profile.get("device"),
+            "flash_address": profile.get("flash_address"),
+            "primary_flash_size_bytes": profile_flash_bytes,
+            "algorithm_files": profile.get("algorithm_files", []),
+        },
+        "planned_action": {
+            "levels": ["program"],
+            "recommended_extra_levels": ["erase"],
+            "address": _format_hex(start_address, 8) if start_address is not None else None,
+            "requires_confirmation": True,
+            "confirmation_phrase": policy["confirmation_phrase"],
+        },
+        "dangerous_action_policy": policy,
+        "errors": errors,
+        "warnings": warnings,
+        "next_steps": [
+            "Review firmware path, hash, size, target profile, and address.",
+            "If hardware is connected, run target_summary with flash info before programming.",
+            "Only after the user explicitly asks to program should a future programming tool require execute=true and the configured confirmation phrase.",
+        ],
+    }
+    if target_summary_result is not None:
+        result["target_summary"] = target_summary_result
+    return result
+
+
+LUA_TEMPLATES: dict[str, dict[str, Any]] = {
+    "uart_at_command": {
+        "interface": "uart",
+        "description": "Send one text command through a selected UART channel and print the bounded response.",
+        "defaults": {"channel": 1, "baudrate": 115200, "command": "AT\\r\\n", "rx_length": 128, "timeout_ms": 500},
+        "dangerous": False,
+    },
+    "modbus_rtu_read_holding": {
+        "interface": "uart",
+        "description": "Build one Modbus RTU read-holding-registers request for UART/RS-485 experiments.",
+        "defaults": {"channel": 1, "baudrate": 9600, "slave": 1, "address": 0, "count": 2, "timeout_ms": 800},
+        "dangerous": False,
+    },
+    "i2c_register_read": {
+        "interface": "i2c",
+        "description": "Read bytes from one 8-bit register address.",
+        "defaults": {"clock_hz": 100000, "address": "0x50", "register": "0x00", "read_length": 1},
+        "dangerous": False,
+    },
+    "spi_jedec_id": {
+        "interface": "spi",
+        "description": "Read a common SPI flash JEDEC ID using command 0x9F.",
+        "defaults": {"freq_id": 0, "phase": 0, "polarity": 0, "cs": 0, "read_length": 3},
+        "dangerous": False,
+    },
+    "can_tx_frame": {
+        "interface": "can",
+        "description": "Transmit one bounded CAN/CAN-FD frame.",
+        "defaults": {"mode": 0, "fifo_len": 8, "bitrate": 500000, "id": "0x321", "data_hex": "01 02 03 04"},
+        "dangerous": False,
+    },
+}
+
+
+def _lua_string_literal(value: str) -> str:
+    return json.dumps(value, ensure_ascii=True)
+
+
+def render_lua_template(name: str, parameters: dict[str, Any] | None = None) -> str:
+    params = dict(LUA_TEMPLATES[name]["defaults"])
+    if parameters:
+        params.update(parameters)
+    if name == "uart_at_command":
+        return "\n".join(
+            [
+                'print("H7TOOL_USER_BEGIN")',
+                'print("operation=uart_at_command")',
+                f"uart_open({int(params['channel'])}, {int(params['baudrate'])}, 0, 8, 1)",
+                f"uart_send({int(params['channel'])}, {_lua_string_literal(str(params['command']))})",
+                f"rx = uart_recive({int(params['channel'])}, {int(params['rx_length'])}, {int(params['timeout_ms'])})",
+                'print("rx_len=" .. string.len(rx))',
+                'print("rx_text=" .. rx)',
+                'print("H7TOOL_USER_END")',
+            ]
+        )
+    if name == "modbus_rtu_read_holding":
+        slave = int(params["slave"])
+        address = int(params["address"])
+        count = int(params["count"])
+        pdu = [slave, 3, (address >> 8) & 0xFF, address & 0xFF, (count >> 8) & 0xFF, count & 0xFF]
+        crc = 0xFFFF
+        for byte in pdu:
+            crc ^= byte
+            for _bit in range(8):
+                crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+        payload = " ".join(f"{byte:02X}" for byte in pdu + [crc & 0xFF, (crc >> 8) & 0xFF])
+        return "\n".join(
+            [
+                'print("H7TOOL_USER_BEGIN")',
+                'print("operation=modbus_rtu_read_holding")',
+                f"uart_open({int(params['channel'])}, {int(params['baudrate'])}, 0, 8, 1)",
+                f'tx = string.char({", ".join(str(byte) for byte in pdu + [crc & 0xFF, (crc >> 8) & 0xFF])})',
+                f"uart_send({int(params['channel'])}, tx)",
+                f"rx = uart_recive({int(params['channel'])}, 256, {int(params['timeout_ms'])})",
+                f'print("tx_hex={payload}")',
+                'print("rx_len=" .. string.len(rx))',
+                'print("rx_text=" .. rx)',
+                'print("H7TOOL_USER_END")',
+            ]
+        )
+    if name == "i2c_register_read":
+        address = _parse_hex_address(params["address"], "address") if isinstance(params["address"], str) else int(params["address"])
+        register = _parse_hex_address(params["register"], "register") if isinstance(params["register"], str) else int(params["register"])
+        return "\n".join(
+            [
+                'print("H7TOOL_USER_BEGIN")',
+                'print("operation=i2c_register_read")',
+                f"i2c_bus(\"init\", {int(params['clock_hz'])})",
+                'i2c_bus("start")',
+                f'print("ack_addr_w=" .. i2c_bus("send", {address * 2}))',
+                f'print("ack_reg=" .. i2c_bus("send", {register & 0xFF}))',
+                'i2c_bus("start")',
+                f'print("ack_addr_r=" .. i2c_bus("send", {address * 2 + 1}))',
+                f'rx = i2c_bus("recive", {int(params["read_length"])})',
+                'i2c_bus("stop")',
+                'print("rx_len=" .. string.len(rx))',
+                'print("rx_text=" .. rx)',
+                'print("H7TOOL_USER_END")',
+            ]
+        )
+    if name == "spi_jedec_id":
+        return "\n".join(
+            [
+                'print("H7TOOL_USER_BEGIN")',
+                'print("operation=spi_jedec_id")',
+                f"spi_bus(\"init\", {int(params['freq_id'])}, {int(params['phase'])}, {int(params['polarity'])})",
+                f"gpio_write({int(params['cs'])}, 0)",
+                'spi_bus("send", string.char(0x9F))',
+                f'rx = spi_bus("recive", {int(params["read_length"])})',
+                f"gpio_write({int(params['cs'])}, 1)",
+                'print("rx_len=" .. string.len(rx))',
+                'print("rx_text=" .. rx)',
+                'print("H7TOOL_USER_END")',
+            ]
+        )
+    if name == "can_tx_frame":
+        data = parse_hex_bytes(str(params["data_hex"]))
+        if len(data) > 64:
+            raise BridgeError("data_hex must be at most 64 bytes")
+        return "\n".join(
+            [
+                'print("H7TOOL_USER_BEGIN")',
+                'print("operation=can_tx_frame")',
+                f"can_bus(\"open\", {int(params['mode'])}, {int(params['fifo_len'])}, {int(params['bitrate'])}, {int(params.get('data_bitrate', params['bitrate']))})",
+                f"can_bus(\"send\", 0, 0, {_parse_hex_address(params['id'], 'id') if isinstance(params['id'], str) else int(params['id'])}, string.char({', '.join(str(byte) for byte in data)}))",
+                f'print("tx_hex={" ".join(f"{byte:02X}" for byte in data)}")',
+                'print("H7TOOL_USER_END")',
+            ]
+        )
+    raise BridgeError("unknown Lua template")
+
+
+def lua_template_library(arguments: dict[str, Any]) -> dict[str, Any]:
+    template = str(arguments.get("template", "")).strip()
+    parameters = arguments.get("parameters") if isinstance(arguments.get("parameters"), dict) else {}
+    if not template:
+        return {"templates": [{"name": name, **meta} for name, meta in LUA_TEMPLATES.items()]}
+    if template not in LUA_TEMPLATES:
+        raise BridgeError("template must be one of: " + ", ".join(sorted(LUA_TEMPLATES)))
+    content = render_lua_template(template, parameters)
+    result: dict[str, Any] = {
+        "template": {"name": template, **LUA_TEMPLATES[template]},
+        "content": content,
+        "validation": validate_lua_draft_text(content),
+        "review": review_lua_draft_text(content),
+    }
+    draft_name = str(arguments.get("create_draft_name", "")).strip()
+    if draft_name:
+        result["draft"] = lua_draft_create({"name": draft_name, "content": content, "overwrite": bool(arguments.get("overwrite", False))})
+    return result
+
+
+def lua_debug_workflow(arguments: dict[str, Any]) -> dict[str, Any]:
+    goal = str(arguments.get("goal", "")).strip() or "hardware debugging"
+    interface = str(arguments.get("interface", "")).strip().lower()
+    template = str(arguments.get("template", "")).strip()
+    steps = [
+        {"step": "search_examples", "tool": "lua_example_search", "purpose": "Find bundled examples for the bus or device before inventing a script."},
+        {"step": "choose_template", "tool": "lua_template_library", "purpose": "Start from a known bounded template when possible."},
+        {"step": "create_draft", "tool": "lua_draft_create", "purpose": "Save the small Lua helper under workspace/lua_drafts."},
+        {"step": "review", "tool": "lua_draft_review", "purpose": "Classify the draft before hardware execution."},
+        {"step": "run", "tool": "lua_draft_run", "purpose": "Run with execute=true; add confirmation only if review detects dangerous levels."},
+        {"step": "iterate", "tool": "lua_draft_create", "purpose": "Revise the draft from raw output and rerun the narrow test."},
+        {"step": "report", "tool": "diagnostic_report", "purpose": "Produce a redacted Markdown summary when the session is done."},
+    ]
+    suggested_templates = [
+        name for name, meta in LUA_TEMPLATES.items() if not interface or meta.get("interface") == interface
+    ]
+    result: dict[str, Any] = {
+        "goal": goal,
+        "interface": interface or None,
+        "recommended_workflow": steps,
+        "suggested_templates": suggested_templates,
+        "guardrails": [
+            "Keep each script single-purpose and bounded.",
+            "Use existing MCP bus tools for simple transactions before writing Lua.",
+            "Dangerous actions require the concrete dangerous level and confirmation phrase; ordinary bus debugging does not.",
+        ],
+    }
+    if template:
+        result["template_preview"] = lua_template_library({"template": template, "parameters": arguments.get("parameters", {})})
+    return result
+
+
+def dangerous_action_plan(arguments: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    action = str(arguments.get("action", "")).strip() or "dangerous hardware action"
+    levels_arg = arguments.get("levels", [])
+    if isinstance(levels_arg, str):
+        levels = [levels_arg]
+    elif isinstance(levels_arg, list):
+        levels = [str(item) for item in levels_arg]
+    else:
+        levels = []
+    if not levels:
+        levels = ["program"] if "program" in action.lower() or "烧" in action else ["write"]
+    for level in levels:
+        if level not in DANGEROUS_ACTION_LEVELS:
+            raise BridgeError("levels must only contain: " + ", ".join(DANGEROUS_ACTION_LEVELS))
+    policy = dangerous_action_policy(config)
+    missing = [level for level in levels if level not in policy["allowed_levels"]]
+    return {
+        "action": action,
+        "levels": levels,
+        "executed": False,
+        "policy_enabled": policy["enabled"],
+        "allowed_by_config": policy["enabled"] and not missing,
+        "missing_levels": missing,
+        "confirmation_phrase": policy["confirmation_phrase"],
+        "required_request_fields": {"execute": True, "confirmation": policy["confirmation_phrase"]},
+        "recommended_preflight": "programming_preflight" if "program" in levels else "lua_draft_review",
+        "notes": [
+            "This tool only explains the gate; it never modifies hardware.",
+            "Use the concrete dangerous levels. raw_lua is informational for Lua drafts and is not a second approval.",
+        ],
+    }
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _redact_value(item) for key, item in value.items() if key not in {"serial_number", "uid_hex", "uid_bytes", "sha256", "first16_hex", "path", "source"}}
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, str):
+        text = re.sub(r"\b[0-9A-Fa-f]{16,}\b", "<redacted>", value)
+        text = re.sub(r"[A-Za-z]:[\\/][^\s`]+", "<local-path>", text)
+        text = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<ip>", text)
+        return text
+    return value
+
+
+def diagnostic_report(arguments: dict[str, Any], config: dict[str, Any], sections: dict[str, Any] | None = None) -> dict[str, Any]:
+    title = str(arguments.get("title", "")).strip() or "H7-TOOL MCP Diagnostic Report"
+    sections = sections or {}
+    adapter = config.get("adapter", {}) if isinstance(config.get("adapter"), dict) else {}
+    drafts = lua_draft_list()
+    profile_result = None
+    if isinstance(arguments.get("relative_path"), str) and arguments.get("relative_path"):
+        try:
+            profile_result = read_device_profile({"relative_path": arguments["relative_path"]})
+        except BridgeError as exc:
+            profile_result = {"error": str(exc)}
+    payload = _redact_value(
+        {
+            "adapter": {"type": adapter.get("type"), "timeout_ms": adapter.get("timeout_ms")},
+            "profile": profile_result,
+            "drafts": {"count": drafts["count"], "items": drafts["drafts"]},
+            "dangerous_action_policy": dangerous_action_policy(config),
+            "sections": sections,
+        }
+    )
+    lines = [
+        f"# {title}",
+        "",
+        "## Summary",
+        "",
+        f"- Adapter type: `{payload['adapter'].get('type')}`",
+        f"- Lua drafts: `{payload['drafts'].get('count')}`",
+        f"- Dangerous actions enabled: `{payload['dangerous_action_policy'].get('enabled')}`",
+        "",
+        "## Data",
+        "",
+        "```json",
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        "```",
+        "",
+        "## Notes",
+        "",
+        "- Local paths, IP addresses, serial numbers, UIDs, hashes, and raw captures are redacted or omitted.",
+        "- This report is suitable for sharing as a high-level debugging summary.",
+    ]
+    markdown = "\n".join(lines)
+    result: dict[str, Any] = {"format": "markdown", "markdown": markdown, "redacted": True}
+    output = str(arguments.get("output", "")).strip()
+    if output:
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", output)
+        if not name.lower().endswith(".md"):
+            name += ".md"
+        report_root = Path(__file__).resolve().parent / "workspace" / "reports"
+        report_root.mkdir(parents=True, exist_ok=True)
+        report_path = report_root / name
+        report_path.write_text(markdown, encoding="utf-8")
+        result["output"] = {"path": str(report_path), "relative_path": _workspace_relative(report_path)}
+    return result
 
 
 def resolve_device_script(arguments: dict[str, Any]) -> Path:
@@ -2119,12 +2588,19 @@ class H7ToolHidModbusAdapter:
             "No matching H7-TOOL HID response. Verify the vendor PC application is closed and the tool is not in another active HID mode."
         )
 
-    def _run_lua_script(self, script: bytes, script_label: str, begin_marker: bytes, end_marker: bytes) -> dict[str, Any]:
+    def _run_lua_script(
+        self,
+        script: bytes,
+        script_label: str,
+        begin_marker: bytes | None,
+        end_marker: bytes | None,
+    ) -> dict[str, Any]:
         try:
             import hid  # type: ignore[import-not-found]
         except ImportError as exc:
             raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
-        if begin_marker not in script or end_marker not in script:
+        strict_markers = begin_marker is not None and end_marker is not None
+        if strict_markers and (begin_marker not in script or end_marker not in script):
             raise BridgeError(f"Lua script {script_label} failed its safety marker check")
         item = self._find_interface()
         timeout_ms = max(1000, int(self.config.get("timeout_ms", 8000)))
@@ -2134,6 +2610,7 @@ class H7ToolHidModbusAdapter:
         output = bytearray()
         ack_seen = False
         reports = 0
+        last_output_at = 0.0
         dev = hid.device()
         try:
             dev.open_path(item["path"])
@@ -2149,6 +2626,8 @@ class H7ToolHidModbusAdapter:
                     dev.write(self._report(self._lua_poll_frame(channel)))
                     channel = (channel + 1) % 5
                     next_poll = now + 0.02
+                if not strict_markers and ack_seen and output and last_output_at and now - last_output_at > 0.35:
+                    break
                 report = bytes(dev.read(1024, 50))
                 if not report:
                     continue
@@ -2163,8 +2642,9 @@ class H7ToolHidModbusAdapter:
                         continue
                     text = text.lstrip(b"\0")
                     output.extend(text)
+                    last_output_at = time.monotonic()
                     decoded = output.decode("utf-8", errors="replace")
-                    if end_marker.decode("ascii") in decoded:
+                    if strict_markers and end_marker.decode("ascii") in decoded:
                         break
         except BridgeError:
             raise
@@ -2178,14 +2658,16 @@ class H7ToolHidModbusAdapter:
         decoded = output.decode("utf-8", errors="replace").strip()
         if not ack_seen:
             raise BridgeError("No H7-TOOL HID Lua acknowledgement; close the vendor PC application and retry")
-        begin_text = begin_marker.decode("ascii")
-        end_text = end_marker.decode("ascii")
-        if begin_text not in decoded or end_text not in decoded:
-            raise BridgeError(f"Lua was acknowledged but diagnostic output was incomplete: {decoded!r}")
+        if strict_markers:
+            begin_text = begin_marker.decode("ascii")
+            end_text = end_marker.decode("ascii")
+            if begin_text not in decoded or end_text not in decoded:
+                raise BridgeError(f"Lua was acknowledged but diagnostic output was incomplete: {decoded!r}")
         return {
             "transport": "h7tool_hid/function_64_lua + function_61_print_poll",
             "script": script_label,
             "reports": reports,
+            "structured_markers": strict_markers,
             "result": parse_response(output),
         }
 
@@ -3128,14 +3610,54 @@ class H7ToolMcp:
             raise BridgeError("Lua draft validation failed: " + "; ".join(blocking_errors))
         dangerous_levels = review.get("dangerous_levels", [])
         if isinstance(dangerous_levels, list) and dangerous_levels:
-            require_dangerous_confirmation(self.config, "raw_lua", confirmation)
             for level in dangerous_levels:
                 require_dangerous_confirmation(self.config, str(level), confirmation)
         script = content.encode("utf-8")
-        result = self.hid_modbus._run_lua_script(script, f"workspace/lua_drafts/{path.name}", b"H7TOOL_USER_BEGIN", b"H7TOOL_USER_END")
+        has_user_markers = b"H7TOOL_USER_BEGIN" in script and b"H7TOOL_USER_END" in script
+        begin_marker = b"H7TOOL_USER_BEGIN" if has_user_markers else None
+        end_marker = b"H7TOOL_USER_END" if has_user_markers else None
+        result = self.hid_modbus._run_lua_script(script, f"workspace/lua_drafts/{path.name}", begin_marker, end_marker)
         result["review"] = review
         result["draft"] = {"name": path.name, "relative_path": f"workspace/lua_drafts/{path.name}"}
+        result["output_contract"] = "structured_markers" if has_user_markers else "raw_output"
         return result
+
+    def programming_preflight(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        target_result = None
+        target_error = None
+        if bool(arguments.get("include_target_check", False)):
+            try:
+                target_args = {key: value for key, value in arguments.items() if key not in {"firmware_path", "address", "include_target_check"}}
+                target_args["include_flash_info"] = True
+                target_result = self.target_summary(target_args)
+            except BridgeError as exc:
+                target_error = str(exc)
+        result = programming_preflight(arguments, self.config, target_result)
+        if target_error is not None:
+            result.setdefault("warnings", []).append(f"Target check failed: {target_error}")
+            result["target_check_error"] = target_error
+        return result
+
+    def diagnostic_report(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        sections: dict[str, Any] = {}
+        if bool(arguments.get("include_status", False)):
+            try:
+                status = self.status()
+                sections["status"] = {
+                    "server": status.get("server"),
+                    "adapter": status.get("adapter"),
+                    "hid_device_count": len(status.get("h7tool_hid_devices", [])) if isinstance(status.get("h7tool_hid_devices"), list) else None,
+                    "serial_port_count": len(status.get("serial_ports", [])) if isinstance(status.get("serial_ports"), list) else None,
+                }
+            except BridgeError as exc:
+                sections["status_error"] = str(exc)
+        if bool(arguments.get("include_target_summary", False)):
+            try:
+                target_args = {"relative_path": arguments["relative_path"]} if isinstance(arguments.get("relative_path"), str) and arguments.get("relative_path") else {}
+                sections["target_summary"] = self.target_summary(target_args)
+            except BridgeError as exc:
+                sections["target_summary_error"] = str(exc)
+        return diagnostic_report(arguments, self.config, sections)
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "bridge_status":
@@ -3158,6 +3680,10 @@ class H7ToolMcp:
             )
         if name == "lua_authoring_rules":
             return lua_authoring_rules()
+        if name == "lua_template_library":
+            return lua_template_library(arguments)
+        if name == "lua_debug_workflow":
+            return lua_debug_workflow(arguments)
         if name == "lua_draft_create":
             return lua_draft_create(arguments)
         if name == "lua_draft_list":
@@ -3174,6 +3700,12 @@ class H7ToolMcp:
             return dangerous_action_policy(self.config)
         if name == "dangerous_action_explain":
             return dangerous_action_explain(arguments)
+        if name == "dangerous_action_plan":
+            return dangerous_action_plan(arguments, self.config)
+        if name == "programming_preflight":
+            return self.programming_preflight(arguments)
+        if name == "diagnostic_report":
+            return self.diagnostic_report(arguments)
         if name == "device_profile":
             return read_device_profile(arguments)
         if name == "device_capabilities":
@@ -3292,6 +3824,34 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "lua_template_library",
+        "description": "List or render bounded Lua helper templates for UART, Modbus RTU, I2C, SPI, and CAN debugging. Can optionally save the rendered script as an offline draft.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "template": {"type": "string", "enum": ["uart_at_command", "modbus_rtu_read_holding", "i2c_register_read", "spi_jedec_id", "can_tx_frame"]},
+                "parameters": {"type": "object", "description": "Template-specific parameter overrides."},
+                "create_draft_name": {"type": "string", "description": "Optional draft filename under workspace/lua_drafts."},
+                "overwrite": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "lua_debug_workflow",
+        "description": "Return an AI-friendly workflow for searching examples, generating Lua drafts, reviewing, running, iterating, and reporting a hardware debugging task.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string"},
+                "interface": {"type": "string", "enum": ["uart", "i2c", "spi", "can", "rtt"]},
+                "template": {"type": "string", "enum": ["uart_at_command", "modbus_rtu_read_holding", "i2c_register_read", "spi_jedec_id", "can_tx_frame"]},
+                "parameters": {"type": "object"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "lua_draft_create",
         "description": "Create or replace an offline Lua draft under workspace/lua_drafts. Does not execute Lua or contact hardware.",
         "inputSchema": {
@@ -3346,13 +3906,13 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "lua_draft_run",
-        "description": "Run one saved Lua draft through H7-TOOL HID after validation, review, and explicit execute=true. Dangerous drafts also require the configured confirmation phrase.",
+        "description": "Run one saved Lua draft through H7-TOOL HID after validation, review, and explicit execute=true. Ordinary debugging drafts may return raw output; dangerous drafts also require the configured confirmation phrase.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Saved draft name under workspace/lua_drafts."},
                 "execute": {"type": "boolean", "description": "Must be true for every run."},
-                "confirmation": {"type": "string", "description": "Required only when review detects dangerous levels allowed by dangerous_action_policy."},
+                "confirmation": {"type": "string", "description": "Required only when review detects concrete dangerous levels allowed by dangerous_action_policy."},
             },
             "required": ["name", "execute"],
             "additionalProperties": False,
@@ -3360,7 +3920,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "dangerous_action_policy",
-        "description": "Show whether dangerous write/erase/program/protection/power/raw_lua actions are enabled and which levels are allowed. Does not execute anything.",
+        "description": "Show whether dangerous write/erase/program/protection/power actions are enabled and which levels are allowed. Does not execute anything.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -3370,6 +3930,51 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "level": {"type": "string", "enum": ["write", "erase", "program", "protection", "power", "raw_lua"], "description": "Optional level to explain. Omit to list all levels."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "dangerous_action_plan",
+        "description": "Explain which dangerous action levels and confirmation fields would be required for a future write/erase/program/protection/power operation. Never modifies hardware.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "levels": {"type": "array", "items": {"type": "string", "enum": ["write", "erase", "program", "protection", "power", "raw_lua"]}},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "programming_preflight",
+        "description": "Check a firmware file, selected target profile, flash size metadata, address, and dangerous-action policy before any future programming action. Does not write, erase, or program hardware.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "firmware_path": {"type": "string"},
+                "address": {"type": "string", "pattern": "^0x[0-9A-Fa-f]+$"},
+                "relative_path": {"type": "string"},
+                "vendor": {"type": "string"},
+                "series": {"type": "string"},
+                "device": {"type": "string"},
+                "include_target_check": {"type": "boolean", "default": False},
+            },
+            "required": ["firmware_path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "diagnostic_report",
+        "description": "Generate a redacted Markdown diagnostic report for sharing or handoff. Omits local paths, IPs, serial numbers, UIDs, hashes, and raw captures.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "relative_path": {"type": "string"},
+                "include_status": {"type": "boolean", "default": False},
+                "include_target_summary": {"type": "boolean", "default": False},
+                "output": {"type": "string", "description": "Optional report filename under workspace/reports."},
             },
             "additionalProperties": False,
         },
@@ -3917,6 +4522,31 @@ def self_test(_server: H7ToolMcp) -> int:
     assert safe_review["review"]["classification"] == "non_destructive"
     dangerous_review = lua_draft_review({"content": 'print("H7TOOL_USER_BEGIN")\nerase_chip()\nprint("ok=0")\nprint("H7TOOL_USER_END")\n'})
     assert dangerous_review["review"]["requires_dangerous_confirmation"] is True
+    bus_debug_review = lua_draft_review({"content": 'uart_send(1, "AT\\r\\n")\nprint("sent=1")\n'})
+    assert bus_debug_review["review"]["classification"] == "non_destructive"
+    templates = lua_template_library({})
+    assert any(item["name"] == "spi_jedec_id" for item in templates["templates"])
+    spi_template = lua_template_library({"template": "spi_jedec_id"})
+    assert "spi_bus" in spi_template["content"]
+    assert spi_template["review"]["classification"] == "non_destructive"
+    workflow = lua_debug_workflow({"goal": "read SPI flash ID", "interface": "spi"})
+    assert "spi_jedec_id" in workflow["suggested_templates"]
+    danger_plan = dangerous_action_plan({"action": "program firmware", "levels": ["program"]}, server.config)
+    assert danger_plan["executed"] is False
+    assert danger_plan["recommended_preflight"] == "programming_preflight"
+    preflight = programming_preflight(
+        {
+            "firmware_path": str(Path(__file__)),
+            "relative_path": "ST/STM32H7xx/STM32H7x_2M.lua",
+            "address": "0x08000000",
+        },
+        server.config,
+    )
+    assert preflight["executed"] is False
+    assert preflight["firmware"]["size_bytes"] > 0
+    report = diagnostic_report({"title": "Unit Test", "relative_path": "ST/STM32H7xx/STM32H7x_2M.lua"}, server.config)
+    assert report["redacted"] is True
+    assert "<local-path>" in report["markdown"] or "local paths" in report["markdown"].lower()
     try:
         server.call_tool("lua_draft_run", {"name": "self_test.lua", "execute": False})
     except BridgeError:
@@ -4034,6 +4664,11 @@ def main() -> int:
     parser.add_argument("--lua-example-limit", type=int, default=30, help="Maximum Lua example search results")
     parser.add_argument("--include-programmer-profiles", action="store_true", help="Include SPI-Flash and I2C-EEPROM programmer profiles in --lua-example-search")
     parser.add_argument("--lua-authoring-rules", action="store_true", help="Print public rules for AI-authored H7-TOOL Lua helper scripts")
+    parser.add_argument("--lua-template-library", nargs="?", const="", metavar="TEMPLATE", help="List or render a bounded Lua debugging template")
+    parser.add_argument("--lua-template-params", default="{}", help="JSON object with template parameter overrides")
+    parser.add_argument("--lua-template-create-draft", metavar="NAME", help="Save rendered --lua-template-library output as a Lua draft")
+    parser.add_argument("--lua-debug-workflow", nargs="?", const="", metavar="GOAL", help="Print an AI workflow for Lua-assisted hardware debugging")
+    parser.add_argument("--lua-debug-interface", choices=["uart", "i2c", "spi", "can", "rtt"], help="Interface for --lua-debug-workflow")
     parser.add_argument("--lua-draft-list", action="store_true", help="List offline Lua drafts")
     parser.add_argument("--lua-draft-read", metavar="NAME", help="Read one offline Lua draft")
     parser.add_argument("--lua-draft-validate", metavar="NAME", help="Validate one offline Lua draft")
@@ -4043,6 +4678,15 @@ def main() -> int:
     parser.add_argument("--confirmation", default="", help="Confirmation phrase for dangerous actions")
     parser.add_argument("--dangerous-action-policy", action="store_true", help="Show dangerous action gate policy")
     parser.add_argument("--dangerous-action-explain", choices=["write", "erase", "program", "protection", "power", "raw_lua"], help="Explain one dangerous action level")
+    parser.add_argument("--dangerous-action-plan", metavar="ACTION", help="Explain confirmation requirements for a future dangerous action")
+    parser.add_argument("--dangerous-action-level", action="append", choices=["write", "erase", "program", "protection", "power", "raw_lua"], help="Level for --dangerous-action-plan; can be repeated")
+    parser.add_argument("--programming-preflight", metavar="FIRMWARE", help="Run offline programming preflight for a firmware file")
+    parser.add_argument("--programming-address", metavar="ADDRESS", help="Start address for --programming-preflight")
+    parser.add_argument("--programming-target-check", action="store_true", help="With --programming-preflight, also attempt a live target summary")
+    parser.add_argument("--diagnostic-report", nargs="?", const="", metavar="OUTPUT", help="Generate a redacted Markdown diagnostic report; optional output filename under workspace/reports")
+    parser.add_argument("--report-title", default="", help="Title for --diagnostic-report")
+    parser.add_argument("--report-include-status", action="store_true", help="With --diagnostic-report, include redacted local status counts")
+    parser.add_argument("--report-include-target", action="store_true", help="With --diagnostic-report, attempt a redacted target summary")
     parser.add_argument("--device-profile", metavar="RELATIVE_PATH", help="Parse one local H7-TOOL device Lua profile")
     parser.add_argument("--device-capabilities", metavar="RELATIVE_PATH", help="Inspect one local H7-TOOL device Lua profile and summarize inferred capabilities")
     parser.add_argument("--self-test", action="store_true", help="Test MCP logic using only the built-in mock adapter")
@@ -4139,6 +4783,28 @@ def main() -> int:
     if args.lua_authoring_rules:
         print(json.dumps(lua_authoring_rules(), ensure_ascii=False, indent=2))
         return 0
+    if args.lua_template_library is not None:
+        try:
+            params = json.loads(args.lua_template_params)
+            if not isinstance(params, dict):
+                raise BridgeError("--lua-template-params must be a JSON object")
+            template_args: dict[str, Any] = {"parameters": params}
+            if args.lua_template_library:
+                template_args["template"] = args.lua_template_library
+            if args.lua_template_create_draft:
+                template_args["create_draft_name"] = args.lua_template_create_draft
+                template_args["overwrite"] = args.execute
+            print(json.dumps(lua_template_library(template_args), ensure_ascii=False, indent=2))
+            return 0
+        except (BridgeError, json.JSONDecodeError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.lua_debug_workflow is not None:
+        workflow_args: dict[str, Any] = {"goal": args.lua_debug_workflow}
+        if args.lua_debug_interface:
+            workflow_args["interface"] = args.lua_debug_interface
+        print(json.dumps(lua_debug_workflow(workflow_args), ensure_ascii=False, indent=2))
+        return 0
     if args.lua_draft_list:
         try:
             print(json.dumps(lua_draft_list(), ensure_ascii=False, indent=2))
@@ -4167,7 +4833,7 @@ def main() -> int:
         except BridgeError as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
             return 2
-    if args.device_profile is not None:
+    if args.device_profile is not None and args.programming_preflight is None and args.diagnostic_report is None:
         print(json.dumps(read_device_profile({"relative_path": args.device_profile}), ensure_ascii=False, indent=2))
         return 0
     if args.device_capabilities is not None:
@@ -4183,6 +4849,42 @@ def main() -> int:
     if args.dangerous_action_explain is not None:
         print(json.dumps(dangerous_action_explain({"level": args.dangerous_action_explain}), ensure_ascii=False, indent=2))
         return 0
+    if args.dangerous_action_plan is not None:
+        print(
+            json.dumps(
+                server.call_tool("dangerous_action_plan", {"action": args.dangerous_action_plan, "levels": args.dangerous_action_level or []}),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.programming_preflight is not None:
+        try:
+            preflight_args: dict[str, Any] = {"firmware_path": args.programming_preflight, "include_target_check": args.programming_target_check}
+            if args.programming_address:
+                preflight_args["address"] = args.programming_address
+            if args.device_profile:
+                preflight_args["relative_path"] = args.device_profile
+            print(json.dumps(server.call_tool("programming_preflight", preflight_args), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+    if args.diagnostic_report is not None:
+        try:
+            report_args: dict[str, Any] = {
+                "title": args.report_title,
+                "output": args.diagnostic_report,
+                "include_status": args.report_include_status,
+                "include_target_summary": args.report_include_target,
+            }
+            if args.device_profile:
+                report_args["relative_path"] = args.device_profile
+            print(json.dumps(server.call_tool("diagnostic_report", report_args), ensure_ascii=False, indent=2))
+            return 0
+        except BridgeError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
     if args.lua_draft_run is not None:
         try:
             print(

@@ -11,9 +11,12 @@
 - 按厂商、系列、芯片名搜索本地 H7-TOOL 设备 Lua 库。
 - 搜索 H7-TOOL 自带 Lua 示例和总线辅助脚本，辅助 AI 查找原始外设用法。
 - 提供 AI 编写 H7-TOOL Lua 辅助脚本的公开规则和安全边界。
+- 提供常用 Lua 调试模板和 AI 调试工作流，覆盖 UART、Modbus RTU、I2C、SPI、CAN 等常见实验。
 - 提供离线 Lua 草稿工作区：创建、列出、读取和校验草稿，但不执行脚本。
 - 支持对 Lua 草稿做静态审查，并在显式确认后运行通过校验的草稿。
 - 提供危险动作门禁策略，供后续烧录、擦除、解锁、改保护等动作统一使用。
+- 提供烧录前预检：检查固件文件、哈希、大小、起始地址、目标 profile、Flash 元数据和危险动作策略，但不执行烧录。
+- 生成脱敏 Markdown 诊断报告，适合论坛交流、issue、阶段归档或交接。
 - 解析芯片 profile 中的接口类型、期望 ID、UID 位置、存储器范围、依赖库和算法条目。
 - 汇总 profile 能力，方便 AI 理解当前芯片配置大致支持哪些操作。
 - 探测已连接的 STM32H7 目标板，并与选定的本地 profile 合并成目标信息。
@@ -84,10 +87,16 @@ python h7tool_mcp.py --device-vendors
 python h7tool_mcp.py --device-search STM32H743 --device-vendor ST
 python h7tool_mcp.py --lua-example-search BH1750 --lua-example-interface i2c
 python h7tool_mcp.py --lua-authoring-rules
+python h7tool_mcp.py --lua-template-library
+python h7tool_mcp.py --lua-template-library spi_jedec_id
+python h7tool_mcp.py --lua-debug-workflow "读取 SPI Flash JEDEC ID" --lua-debug-interface spi
 python h7tool_mcp.py --lua-draft-list
 python h7tool_mcp.py --lua-draft-review example.lua
 python h7tool_mcp.py --dangerous-action-policy
+python h7tool_mcp.py --dangerous-action-plan "program firmware" --dangerous-action-level program
 python h7tool_mcp.py --device-profile ST/STM32H7xx/STM32H7x_2M.lua
+python h7tool_mcp.py --programming-preflight firmware.bin --device-profile ST/STM32H7xx/STM32H7x_2M.lua --programming-address 0x08000000
+python h7tool_mcp.py --diagnostic-report session-summary --device-profile ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --lua-health
 python h7tool_mcp.py --target-identity ST/STM32H7xx/STM32H7x_2M.lua
 python h7tool_mcp.py --target-summary ST/STM32H7xx/STM32H7x_2M.lua
@@ -96,7 +105,7 @@ python h7tool_mcp.py --target-flash-info ST/STM32H7xx/STM32H7x_2M.lua
 
 `config.json` 是本机配置文件，已经被 git 忽略，不需要提交。
 
-危险动作默认关闭。后续烧录、擦除、解锁、改保护、供电控制、执行自定义 Lua 等功能接入时，会先检查 `config.json` 中的 `dangerous_actions`，并要求每次请求提供匹配的确认短语。
+常规调试动作默认可用，例如查询设备、读目标信息、总线收发、RTT 读取、创建和运行非破坏性 Lua 草稿。危险动作默认关闭；烧录、擦除、解锁、改保护、供电控制、改持久存储或寄存器状态等动作接入时，会先检查 `config.json` 中的 `dangerous_actions`，并要求请求里提供匹配的确认短语。
 
 ## 启动 MCP 服务器
 
@@ -268,9 +277,12 @@ AI 编写 Lua 辅助脚本的规则见：[AI 编写 H7-TOOL Lua 辅助脚本规�
 
 1. 先让 AI 调用 `bridge_status`。
 2. 再让 AI 搜索或检查目标芯片 profile。
-3. 然后调用 `lua_health` 或 `health_summary`。
-4. 再调用 `target_summary`。
-5. 目标 profile 确认后，再让 AI 做更具体的内存、Option Byte、RTT 或外设事务。
+3. 需要 Lua 辅助调试时，让 AI 调用 `lua_debug_workflow` 和 `lua_template_library`，生成小草稿。
+4. 调用 `lua_draft_review` 审查草稿；非破坏性调试可以直接用 `lua_draft_run` 加 `execute=true` 运行。
+5. 然后调用 `lua_health`、`health_summary` 或 `target_summary` 做硬件状态确认。
+6. 目标 profile 确认后，再让 AI 做更具体的内存、Option Byte、RTT 或外设事务。
+7. 涉及烧录、擦除、改保护等动作前，先调用 `programming_preflight` 或 `dangerous_action_plan`，确认无误后再进入后续执行工具。
+8. 阶段结束时调用 `diagnostic_report` 生成脱敏 Markdown 报告。
 
 ## 可用 MCP 工具
 
@@ -279,6 +291,8 @@ AI 编写 Lua 辅助脚本的规则见：[AI 编写 H7-TOOL Lua 辅助脚本规�
 - `device_search`
 - `lua_example_search`
 - `lua_authoring_rules`
+- `lua_template_library`
+- `lua_debug_workflow`
 - `lua_draft_create`
 - `lua_draft_list`
 - `lua_draft_read`
@@ -287,6 +301,9 @@ AI 编写 Lua 辅助脚本的规则见：[AI 编写 H7-TOOL Lua 辅助脚本规�
 - `lua_draft_run`
 - `dangerous_action_policy`
 - `dangerous_action_explain`
+- `dangerous_action_plan`
+- `programming_preflight`
+- `diagnostic_report`
 - `device_profile`
 - `device_capabilities`
 - `tool_status`
