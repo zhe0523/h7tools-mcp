@@ -2,7 +2,7 @@
 
 这个项目提供一个本地 MCP 服务器，用来把 H7-TOOL 接入支持 MCP 的 AI 工具。启用之后，AI 可以调用 H7-TOOL 相关工具，查看连接状态、搜索本地芯片库、识别目标板、读取调试诊断信息。
 
-公开文档只说明安装和使用方式，不展开产品内部通信细节。
+安装和使用从本文开始；已验证的私有 HID/Modbus 入口及安全边界见：[H7-TOOL V2.33 未公开固件接口](docs/undocumented-firmware-interfaces.zh-CN.md)。
 
 ## 支持功能
 
@@ -323,6 +323,7 @@ AI 编写 Lua 辅助脚本的规则见：[AI 编写 H7-TOOL Lua 辅助脚本规�
 - `rtt_read`
 - `log_tail`
 - `read_memory`
+- `tool_mode_switch`
 - `device_file_write`
 - `device_file_read`
 
@@ -331,6 +332,17 @@ AI 编写 Lua 辅助脚本的规则见：[AI 编写 H7-TOOL Lua 辅助脚本规�
 H7-TOOL 设备库里的 Lua 脚本经常描述一整个芯片系列，而不是单个精确型号。例如搜索 `STM32H743` 可能会返回通用 STM32H7 profile。需要精确判断型号时，建议结合实机探测结果、profile 元数据和芯片特定寄存器一起判断。
 
 同一时间最好只让一个程序控制同一个 H7-TOOL 操作通道。如果 AI 调用超时或结果异常，先关闭 PC 工具中可能冲突的操作，再重新尝试。
+
+### 原生目标内存读取与模式切换
+
+`read_memory` 在 `adapter.type=h7tool_hid` 时接受 `transport`：
+
+- `lua`（默认）：保持原来的 Lua `pg_read_mem` 路径，兼容已有调用；
+- `native`：直接使用固件私有功能码 `0x66`，首包子功能 0 初始化调试链路，续包子功能 1 连续读取，不经过 Lua VM。
+
+原生读取要求设备已经加载正确的目标/烧录器配置，目标供电和 SWD/SWIM 连线正常；否则设备会返回非零 `status`。当前实现只支持单路目标，多路 SWD 的响应布局尚未纳入。
+
+`tool_mode_switch` 是寄存器 `0xFF7F` 的白名单封装，只允许 `restart_app`、`emmc`、`link`，并要求 `dangerous_actions` 开启 `power` 级别及匹配的确认词。切换后 HID 可能立刻断开或重枚举，这是正常现象。Bootloader、DAP、脱机烧录、任意寄存器写和校准入口不会通过 MCP 暴露。
 
 
 ### 在 H7-TOOL 上读写文件

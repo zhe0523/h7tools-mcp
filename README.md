@@ -199,6 +199,8 @@ These clients use the same local stdio MCP idea. Chinese multi-client guide: [AI
 
 Lua helper authoring rules are documented in Chinese here: [AI 编写 H7-TOOL Lua 辅助脚本规则](docs/lua-authoring-rules.zh-CN.md).
 
+Verified private HID/Modbus entry points and their safety boundaries are documented in Chinese here: [H7-TOOL V2.33 未公开固件接口](docs/undocumented-firmware-interfaces.zh-CN.md).
+
 ## How To Ask The AI To Use It
 
 Once the MCP server is connected, ask the AI to use the H7-TOOL tools directly. Example prompts:
@@ -313,6 +315,7 @@ Good workflow:
 - `rtt_read`
 - `log_tail`
 - `read_memory`
+- `tool_mode_switch`
 - `device_file_write`
 - `device_file_read`
 
@@ -321,6 +324,17 @@ Good workflow:
 Device scripts in the H7-TOOL package often describe whole chip families rather than one exact part number. For example, searching for `STM32H743` may return a generic STM32H7 profile. Use live target data, profile metadata, and chip-specific registers together when exact identification matters.
 
 Only one program should actively control the same H7-TOOL operation path at a time. If an AI call times out or returns an unexpected result, close conflicting operations in the PC tool and try again.
+
+### Native target-memory reads and mode switching
+
+With `adapter.type=h7tool_hid`, `read_memory` accepts a `transport` selector:
+
+- `lua` (default) preserves the existing Lua `pg_read_mem` path;
+- `native` calls private function `0x66` directly, using subfunction 0 to initialise the debug link for the first chunk and subfunction 1 for subsequent chunks, bypassing the Lua VM.
+
+The native path still needs the correct target/programmer profile to be loaded, a powered target, and a valid SWD/SWIM connection. Otherwise the device returns a non-zero `status`. The current bridge supports one target channel; the firmware's multi-SWD response layout is not exposed yet.
+
+`tool_mode_switch` is a whitelist around register `0xFF7F`. It only accepts `restart_app`, `emmc`, and `link`, and requires the configured dangerous-action `power` level plus confirmation phrase. HID may disconnect or re-enumerate immediately after the request. Bootloader, DAP, offline programming, arbitrary register writes, and calibration controls are deliberately not exposed.
 
 
 ### Reading and writing files on the H7-TOOL
