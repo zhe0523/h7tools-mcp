@@ -5,7 +5,7 @@
     "port": 8080,
     "serial_port": "COM1",
     "baudrate": 115200,
-    "timeout_ms": 1000,
+    "timeout_ms": 20000,
     "line_ending": "\r\n"
   },
   "commands": {

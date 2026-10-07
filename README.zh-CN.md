@@ -2,7 +2,7 @@
 
 这个项目提供一个本地 MCP 服务器，用来把 H7-TOOL 接入支持 MCP 的 AI 工具。启用之后，AI 可以调用 H7-TOOL 相关工具，查看连接状态、搜索本地芯片库、识别目标板、读取调试诊断信息。
 
-公开文档只说明安装和使用方式，不展开产品内部通信细节。
+安装和使用从本文开始；已验证的私有 HID/Modbus 入口及安全边界见：[H7-TOOL V2.33 未公开固件接口](docs/undocumented-firmware-interfaces.zh-CN.md)。
 
 ## 支持功能
 
@@ -323,9 +323,96 @@ AI 编写 Lua 辅助脚本的规则见：[AI 编写 H7-TOOL Lua 辅助脚本规�
 - `rtt_read`
 - `log_tail`
 - `read_memory`
+- `tool_mode_switch`
+- `device_file_write`
+- `device_file_read`
 
 ## 说明
 
 H7-TOOL 设备库里的 Lua 脚本经常描述一整个芯片系列，而不是单个精确型号。例如搜索 `STM32H743` 可能会返回通用 STM32H7 profile。需要精确判断型号时，建议结合实机探测结果、profile 元数据和芯片特定寄存器一起判断。
 
 同一时间最好只让一个程序控制同一个 H7-TOOL 操作通道。如果 AI 调用超时或结果异常，先关闭 PC 工具中可能冲突的操作，再重新尝试。
+
+### 原生目标内存读取与模式切换
+
+`read_memory` 在 `adapter.type=h7tool_hid` 时接受 `transport`：
+
+- `lua`（默认）：保持原来的 Lua `pg_read_mem` 路径，兼容已有调用；
+- `native`：直接使用固件私有功能码 `0x66`，首包子功能 0 初始化调试链路，续包子功能 1 连续读取，不经过 Lua VM。
+
+原生读取要求设备已经加载正确的目标/烧录器配置，目标供电和 SWD/SWIM 连线正常；否则设备会返回非零 `status`。当前实现只支持单路目标，多路 SWD 的响应布局尚未纳入。
+
+`tool_mode_switch` 是寄存器 `0xFF7F` 的白名单封装，只允许 `restart_app`、`emmc`、`link`，并要求 `dangerous_actions` 开启 `power` 级别及匹配的确认词。切换后 HID 可能立刻断开或重枚举，这是正常现象。Bootloader、DAP、脱机烧录、任意寄存器写和校准入口不会通过 MCP 暴露。
+
+
+### 在 H7-TOOL 上读写文件
+
+`device_file_write` 和 `device_file_read` 用于向设备的 EMMC（`0:/`）或 SD 卡（`1:/`）传输普通文件。
+
+- 写入属于危险动作，会受门禁控制：在 `config.json` 里设置 `"dangerous_actions": {"enabled": true, "allowed_levels": ["write"], ...}`，并传入与之匹配的 `confirmation` 确认词。读取不受门禁限制。
+- 设备 FAT 以 GBK 存储中文文件名，因此 `path_encoding` 默认为 `gbk`；纯 ASCII 目录可传 `utf-8`。
+- Lua 文件接口没有删除、截断、建目录的函数：目标目录必须已存在，且重写比原文件短的内容会保留旧的尾巴；`device_file_write` 会在 `warnings` 里报告这种情况，请用 PC 软件删除该文件后重新写入。
+- 在 TOOL 上还有 Lua 脚本正在运行时写入，会与功能码 `0x64` 的 Lua 重置相撞，从而写入错误的内容。`verified: false` 就是这个意思：先在 TOOL 上按 **C** 退出正在运行的脚本，再重新写入；在空闲的 TOOL 上写入并核验通过时，内容是逐字节一致的。
+- 超过 16 KiB 的写入、以及跨 4 KiB 页的写入都已在内部处理：单次 `f_write` 不接受大于 16 KiB 的数据，而从非对齐偏移跨越 4096 字节页时设备会重复一个字节。
+- Lua 脚本本身不再限于约 1000 字节：功能码 `0x64` 的三个字段是（总长度, 偏移, 本块长度），桥接会把大脚本分报文传输。
+
+### Lua 调用返回空输出时
+
+设备偶尔会对 `0x64`（下载并执行 Lua）请求回 ack，但既不执行脚本也不打印任何东西，而此时 `tool_status` 等寄存器读取仍然正常。在 H7-TOOL 上按一次 **C**（或重新上电）即可清除卡住的 Lua 会话，然后重试。
+
+桥接已经会对只读和幂等的调用自动重试一次；`lua_draft_run` 也接受 `retry_on_empty: true`，适用于重复执行安全的脚本。
+
+`adapter` 里相关的配置：
+
+| 键 | 默认值 | 含义 |
+|---|---|---|
+| `timeout_ms` | 示例配置为 `20000` | 单次 Lua 调用的总时间窗口 |
+| `print_quiet_ms` | `500` | 无标记脚本的输出静默多久后视为结束 |
+| `lua_chunk_bytes` | `700` | 传输脚本时的 HID 报文负载，不得超过 1000 |
+| `lua_chunk_delay_ms` | `4` | 脚本分块之间的间隔 |
+| `drain_before_run_ms` | `150` | 运行前先消耗旧的打印输出，避免被当成本次结果 |
+
+## 截屏
+
+`screenshot` 抓取 H7-TOOL **自身**的屏幕并存成 PNG。
+
+- 功能码 `0x66`、子功能 `0x0100`（`H66_READ_DISP_MEM`）：固件直接从显存 `0x30000000` 拷贝。
+- 数据是原始 RGB565 小端、行优先、左上原点、stride = 屏宽、**无压缩**；240x320 面板为 153600 字节。
+- `offset` 是显存绝对字节偏移，按 `offset += chunk` 循环取满 `width*height*2` 字节即结束，
+  没有结束标志、没有分块序号。
+- 单包最大 1009 字节（正好放进一个 1024 字节 HID 报文）；APP V2.33 上抓一整帧约 0.26 秒。
+
+两个必须注意的点：**独占 HID interface 2**（先关掉原厂上位机）；打开后**先排空积压报文**
+（有 Lua 程序在重画屏幕时会积压几百个），并且要按 **unit + 功能码 + 子功能 + offset +
+length + CRC** 六重匹配，因为管道里还混着 `01 61 ...` 这类无关的 Lua 打印帧。
+
+### 二进制安全写入
+
+`device_file_write` 的分片以 **base64** 传输。Lua 长字符串本身能容纳 NUL 字节，但固件是把
+整个脚本当 **C 字符串**交给 `luaL_dostring()` 的，脚本里只要有一个 NUL 就被截断，之后每次
+写入都会静默失效。
+
+## EMMC 文件管理（原生通道）
+
+功能码 `0x64` 的 `func` 字段带了一整套文件管理指令（和下载 Lua 用的是同一帧），
+所以**列目录 / 删除 / 建目录都能在线做，DAP 调试口全程不断**。Lua 层做不到：
+`f_dir` 会让固件崩、`os.remove`/`os.rename` 是静默空操作。
+
+| func | 工具 | 说明 |
+|---|---|---|
+| 2 | `device_file_list` | 每行 `F<大小hex>\|<日期 时间>\|<文件名>`，`D` 表示目录 |
+| 3 | `device_file_md5` | 标准 MD5，已与 hashlib 逐字节核对 |
+| 4 | `device_file_delete` | 受 dangerous level `write` 门禁 |
+| 6 | 读文件 | 应答 `total(4) offset(4) bytes(4) 数据` |
+| 7 | 写文件 | 载荷 `大小(4) MD5(16) 名字长(1) 完整路径 数据` |
+| 8 | `device_file_mkdir` | 0 = 成功，1 = 已存在 |
+
+必须处理的固件怪癖：
+
+- 应答是 `func(2) result(1) total(4) offset(4) package_len(4) 数据`，**漏掉 result 字节**
+  会让后面每个字段错位一位；
+- `LIST` 和 `READ` **不会**给路径补 NUL（`DEL`/`MD5` 会 ✓）；
+- `LIST` 的路径**不能带尾部斜杠**，否则返回空清单；
+- `LIST` 把请求的 `package_len` 当成自己应答的长度，所以载荷要用 NUL 填充才能一次取一块；
+- 一帧**只能发一次**：重发 `WRITE_FILE` 会让固件把同样数据缓冲两遍，文件直接翻倍；
+- `DEL_DIR`（5）在固件里声明了但没实现。

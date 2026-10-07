@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
+import zlib
 import hashlib
 import json
 import math
@@ -25,7 +27,44 @@ from typing import Any
 
 
 SERVER_NAME = "h7tool-mcp-assistant"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.10.0"
+# H7-TOOL function 0x64 carries three uint32 fields: total length, offset and the
+# length of this chunk.  A script may therefore span several 1024-byte HID
+# reports; sending it in one report used to cap a Lua script at about 1000 bytes.
+LUA_MAX_CHUNK_BYTES = 1000
+LUA_CHUNK_BYTES = 700
+
+
+# Pieces are carried base64 encoded. A Lua long string can hold NUL bytes, but
+# the firmware hands the script to luaL_dostring() as a C string, so a single NUL
+# inside an embedded piece truncates the script and the write silently does
+# nothing. Base64 also keeps long-string delimiters out of the payload.
+B64_DECODER_LUA = b"""local B64 = {}
+do
+  local a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  for i = 1, #a do B64[string.sub(a, i, i)] = i - 1 end
+end
+local function dec(t)
+  local o, acc, bits = {}, 0, 0
+  for i = 1, #t do
+    local v = B64[string.sub(t, i, i)]
+    if v then
+      acc = acc * 64 + v
+      bits = bits + 6
+      while bits >= 8 do
+        bits = bits - 8
+        o[#o + 1] = string.char(math.floor(acc / (2 ^ bits)) % 256)
+        acc = acc % (2 ^ bits)
+      end
+    end
+  end
+  return table.concat(o)
+end"""
+# f_write() rejects a single payload larger than 16 KiB, and the tool duplicates
+# one byte when a write crosses a 4096-byte page from an unaligned start offset.
+# Writing whole pages from page-aligned offsets avoids both problems.
+DEVICE_FILE_PAGE_BYTES = 4096
+DEVICE_FILE_MAX_READ = 4096
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
 DEVICE_ROOT = Path(__file__).resolve().parent.parent / "EMMC" / "H7-TOOL" / "Programmer" / "Device"
@@ -1150,6 +1189,47 @@ def require_dangerous_confirmation(
     return {"allowed": True, "level": level}
 
 
+def png_from_rgb565(data: bytes, width: int, height: int) -> bytes:
+    """Encode an RGB565 little-endian framebuffer as a PNG using only stdlib."""
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)                       # PNG filter type 0
+        row = y * width * 2
+        for x in range(width):
+            index = row + 2 * x
+            value = data[index] | (data[index + 1] << 8)
+            raw.append((value & 0xF800) >> 8)
+            raw.append((value & 0x07E0) >> 3)
+            raw.append((value & 0x001F) << 3)
+
+    def block(tag: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + tag
+            + payload
+            + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + block(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + block(b"IDAT", zlib.compress(bytes(raw), 6))
+        + block(b"IEND", b"")
+    )
+
+
+def rolling_byte_hash(data: bytes) -> int:
+    """Position-weighted byte sum, mirrored by the Lua verification snippets.
+
+    It only has to detect a wrong write, so a cheap rolling sum beats the
+    tool's own STM32 CRC32 variant, which would need a matching implementation.
+    """
+    total = 0
+    for index, value in enumerate(data, start=1):
+        total = (total + value * index) % 4294967296
+    return total
+
+
 def _parse_hex_address(value: Any, label: str = "address") -> int:
     text = str(value).strip()
     if not text.startswith("0x"):
@@ -2145,6 +2225,8 @@ class ModbusTcpAdapter:
     config: dict[str, Any]
     transaction_id: int = 0
 
+    # ---- native 0x64 file management over the wireless link ----
+
     def read_holding_registers(self, address: int, count: int) -> list[int]:
         if not 0 <= address <= 0xFFFF or not 1 <= count <= 60:
             raise BridgeError("Modbus read address must be 0..65535 and count must be 1..60")
@@ -2212,6 +2294,176 @@ class ModbusUdpAdapter:
     """
 
     config: dict[str, Any]
+
+    def _udp_native_exchange(self, func: int, total: int, offset: int, payload: bytes,
+                             timeout_ms: int | None = None) -> bytes:
+        """One 0x64 exchange over Modbus-RTU/UDP (see _native_exchange in the HID adapter).
+
+        Same frame layout as the USB path; the UDP transport simply needs the RTU CRC and
+        a datagram socket. Frame layout and behaviour were verified on APP V2.33.
+        """
+        host = self.config.get("host")
+        port = self.config.get("port", 30010)
+        if not isinstance(host, str) or not isinstance(port, int):
+            raise BridgeError("modbus_udp adapter requires adapter.host and integer adapter.port")
+        unit_id = int(self.config.get("unit_id", 1))
+        body = struct.pack(">BBHIII", unit_id, 0x64, func, total, offset, len(payload)) + payload
+        frame = body + crc16_modbus(body).to_bytes(2, "little")
+        budget = max(0.5, (timeout_ms or max(3000, int(self.config.get("timeout_ms", 1000)))) / 1000)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                client.settimeout(budget)
+                if bool(self.config.get("session_poll", True)):
+                    for index in range(5):
+                        client.sendto(self._session_poll_frame(index), (host, port))
+                client.sendto(frame, (host, port))
+                deadline = time.monotonic() + budget
+                while time.monotonic() < deadline:
+                    client.settimeout(max(0.05, deadline - time.monotonic()))
+                    try:
+                        reply, _peer = client.recvfrom(4096)
+                    except socket.timeout:
+                        break
+                    if len(reply) < 7 or reply[0] != unit_id or reply[1] != 0x64:
+                        continue
+                    if struct.unpack(">H", reply[2:4])[0] != func:
+                        continue
+                    return reply
+        except BridgeError:
+            raise
+        except Exception as exc:                                  # noqa: BLE001
+            raise BridgeError(f"H7-TOOL wireless file request failed: {exc}") from exc
+        raise BridgeError(f"H7-TOOL wireless file request timed out (func {func})")
+
+    def _lua_poll_raw(self, channel: int, timeout: float = 0.4) -> bytes:
+        """One 0x61 print-channel poll; returns the printable payload (CRC stripped)."""
+        host = self.config.get("host")
+        port = self.config.get("port", 30010)
+        unit_id = int(self.config.get("unit_id", 1))
+        body = bytes([1, 0x61, 0, channel % 5, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0])
+        frame = body + crc16_modbus(body).to_bytes(2, "little")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            client.settimeout(timeout)
+            client.sendto(frame, (host, port))
+            try:
+                reply, _peer = client.recvfrom(8192)
+            except socket.timeout:
+                return b""
+        if len(reply) < 10 or reply[0] != unit_id or reply[1] != 0x61:
+            return b""
+        return reply[8:-2]                                   # header + CRC stripped
+
+    def _run_lua_script(self, script: bytes, script_label: str,
+                        begin_marker: bytes | None = None, end_marker: bytes | None = None,
+                        retry_on_empty: int = 0) -> dict:
+        """Same contract as the USB runner, over the wireless link."""
+        if begin_marker is not None and end_marker is not None:
+            if begin_marker not in script or end_marker not in script:
+                raise BridgeError(f"Lua script {script_label} failed its safety marker check")
+        attempts = 1 + max(0, int(retry_on_empty))
+        raw = b""
+        for attempt in range(attempts):
+            raw = self.run_lua_script(
+                script,
+                quiet_s=max(0.05, float(self.config.get("print_quiet_ms", 500)) / 1000.0))
+            if raw.strip(b"\0 \r\n\t"):
+                break
+            if attempt < attempts - 1:
+                time.sleep(0.4)
+        if not raw.strip(b"\0 \r\n\t"):
+            raise BridgeError(f"Lua {script_label} produced no output over the wireless link")
+        text = raw.decode("utf-8", "replace").replace("\0", "")
+        return {"output": [ln for ln in text.splitlines() if ln.strip()],
+                "raw": text, "transport": "modbus_udp"}
+
+    def _run_lua_script_once(self, script: bytes, script_label: str,
+                             begin_marker: bytes | None = None, end_marker: bytes | None = None,
+                             fail_fast_on_silence: bool = False) -> dict:
+        return self._run_lua_script(script, script_label, begin_marker, end_marker)
+
+    def run_lua_script(self, script: bytes, quiet_s: float = 0.6,
+                       total_timeout_s: float = 25.0) -> bytes:
+        """Upload and run a Lua script over the wireless link, returning its print output.
+
+        Mirrors the USB path: the script is NUL-terminated, sent as (total, offset, chunk)
+        0x64 func 0 requests, and the print channel is polled until it stays quiet.
+        """
+        host = self.config.get("host")
+        port = self.config.get("port", 30010)
+        if not isinstance(host, str) or not isinstance(port, int):
+            raise BridgeError("modbus_udp adapter requires adapter.host and integer adapter.port")
+        payload = script + (b"" if script.endswith(b"\0") else b"\0")
+        total = len(payload)
+        chunk = int(self.config.get("lua_chunk_bytes", 1000))
+        chunk = max(64, min(chunk, 1000))
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        output = bytearray()
+        try:
+            # drain stale prints so they cannot be mistaken for this run's output
+            for channel in range(5):
+                output += self._lua_poll_raw(channel, 0.25)
+            output.clear()
+            offset = 0
+            while offset < total:
+                piece = payload[offset:offset + chunk]
+                self._udp_native_exchange(0, total, offset, piece, timeout_ms=6000)   # func 0
+                offset += len(piece)
+                time.sleep(max(0.0, float(self.config.get("lua_chunk_delay_ms", 4)) / 1000.0))
+            deadline = time.monotonic() + total_timeout_s
+            last = time.monotonic()
+            channel = 0
+            while time.monotonic() < deadline:
+                data = self._lua_poll_raw(channel, 0.4)
+                channel = (channel + 1) % 5
+                if data:
+                    output += data
+                    last = time.monotonic()
+                elif output and time.monotonic() - last >= quiet_s:
+                    break
+                elif not output and time.monotonic() - last > max(3.0, quiet_s * 5):
+                    break
+            return bytes(output)
+        finally:
+            client.close()
+
+    def read_display_memory(self, offset: int, length: int) -> bytes:
+        """Read a slice of the tool's LCD framebuffer over the wireless link.
+
+        Frame: unit | 0x66 | 0x0100(u16) | offset(u32) | length(u32) | crc.
+        The length field is 32-bit here; sending it as 16-bit is silently ignored.
+        """
+        host = self.config.get("host")
+        port = self.config.get("port", 30010)
+        if not isinstance(host, str) or not isinstance(port, int):
+            raise BridgeError("modbus_udp adapter requires adapter.host and integer adapter.port")
+        unit_id = int(self.config.get("unit_id", 1))
+        body = struct.pack(">BBHII", unit_id, 0x66, 0x0100, offset, length)
+        frame = body + crc16_modbus(body).to_bytes(2, "little")
+        budget = max(0.5, int(self.config.get("timeout_ms", 1000)) / 1000)
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                client.settimeout(budget)
+                # V2.33 opens a UDP session with five channel poll frames; without them the
+                # tool answers only while a session from another request is still alive.
+                if bool(self.config.get("session_poll", True)):
+                    for index in range(5):
+                        client.sendto(self._session_poll_frame(index), (host, port))
+                client.sendto(frame, (host, port))
+                deadline = time.monotonic() + budget
+                while time.monotonic() < deadline:
+                    client.settimeout(max(0.05, deadline - time.monotonic()))
+                    try:
+                        reply, _peer = client.recvfrom(4096)
+                    except socket.timeout:
+                        break
+                    if len(reply) < 15 or reply[0] != unit_id or reply[1] != 0x66:
+                        continue
+                    return reply[13:13 + length]      # reply also carries the 2-byte CRC
+        except BridgeError:
+            raise
+        except Exception as exc:                                  # noqa: BLE001
+            raise BridgeError(f"H7-TOOL wireless display read failed: {exc}") from exc
+        return b""
 
     @staticmethod
     def _session_poll_frame(index: int) -> bytes:
@@ -2588,52 +2840,502 @@ class H7ToolHidModbusAdapter:
             "No matching H7-TOOL HID response. Verify the vendor PC application is closed and the tool is not in another active HID mode."
         )
 
+    def write_single_register_no_reply(self, address: int, value: int) -> None:
+        """Send one function-0x06 write without waiting for an acknowledgement.
+
+        Mode changes can tear down the HID interface before an acknowledgement is
+        observable.  This helper is intentionally private to narrowly enumerated,
+        confirmation-gated operations; it is not exposed as arbitrary register write.
+        """
+        if not 0 <= address <= 0xFFFF or not 0 <= value <= 0xFFFF:
+            raise BridgeError("Modbus register address and value must be 0..65535")
+        try:
+            import hid  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
+        item = self._find_interface()
+        unit_id = int(self.config.get("unit_id", 1))
+        body = struct.pack(">BBHH", unit_id, 0x06, address, value)
+        frame = body + crc16_modbus(body).to_bytes(2, "little")
+        dev = hid.device()
+        try:
+            dev.open_path(item["path"])
+            written = dev.write(self._report(frame))
+            if written != 1025:
+                raise BridgeError("H7-TOOL HID write did not accept the mode request")
+        except BridgeError:
+            raise
+        except Exception as exc:
+            raise BridgeError(f"H7-TOOL HID mode request failed: {exc}") from exc
+        finally:
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+    def read_target_memory(self, address: int, length: int, chunk_bytes: int = 960) -> dict[str, Any]:
+        """Read target memory through native function 0x66 subfunctions 0/1.
+
+        Subfunction 0 performs ``pg_init()`` and is used for the first chunk;
+        subfunction 1 continues without reinitialising the debug port.
+        """
+        if not 0 <= address <= 0xFFFFFFFF or not 1 <= length <= 0xFFFFFFFF:
+            raise BridgeError("native target read needs a 32-bit address and a positive length")
+        if not 1 <= chunk_bytes <= 1009:
+            raise BridgeError("native target read chunk must be 1..1009 bytes")
+        if address + length > 0x100000000:
+            raise BridgeError("native target read crosses the 32-bit address boundary")
+        try:
+            import hid  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
+        item = self._find_interface()
+        unit_id = int(self.config.get("unit_id", 1))
+        timeout_ms = max(500, int(self.config.get("timeout_ms", 1000)))
+        data = bytearray()
+        reports = 0
+        dev = hid.device()
+        try:
+            dev.open_path(item["path"])
+            for _ in range(400):
+                if not dev.read(1024, 10):
+                    break
+            while len(data) < length:
+                offset = address + len(data)
+                size = min(chunk_bytes, length - len(data))
+                subfunction = 0 if not data else 1
+                body = struct.pack(">BBHII", unit_id, 0x66, subfunction, offset, size)
+                request = body + crc16_modbus(body).to_bytes(2, "little")
+                if dev.write(self._report(request)) != 1025:
+                    raise BridgeError("H7-TOOL HID write did not accept the native memory request")
+                deadline = time.monotonic() + max(2.0, timeout_ms / 1000)
+                while time.monotonic() < deadline:
+                    # Keep report padding intact.  Stripping zeroes can remove a
+                    # legitimate final CRC byte when crc_hi happens to be 0x00.
+                    reply = bytes(dev.read(1024, min(200, timeout_ms)))
+                    if len(reply) < 15 or reply[0] != unit_id or reply[1] != 0x66:
+                        continue
+                    if struct.unpack(">HII", reply[2:12]) != (subfunction, offset, size):
+                        continue
+                    if reply[12] != 0:
+                        raise BridgeError(
+                            f"H7-TOOL native target read failed at 0x{offset:08X} (status {reply[12]}). "
+                            "Verify target power/wiring and load the correct programmer profile first."
+                        )
+                    piece = reply[13 : 13 + size]
+                    if len(piece) != size:
+                        continue
+                    crc_at = 13 + size
+                    if len(reply) < crc_at + 2:
+                        continue
+                    if crc16_modbus(reply[:crc_at]) != int.from_bytes(reply[crc_at : crc_at + 2], "little"):
+                        continue
+                    data += piece
+                    reports += 1
+                    break
+                else:
+                    raise BridgeError(
+                        f"no matching H7-TOOL native memory reply at 0x{offset:08X}; "
+                        "close the vendor PC application and verify the selected target profile"
+                    )
+        except BridgeError:
+            raise
+        except Exception as exc:
+            raise BridgeError(f"H7-TOOL native target read failed: {exc}") from exc
+        finally:
+            try:
+                dev.close()
+            except Exception:
+                pass
+        parts = [f"{byte:02X}" for byte in data]
+        raw = f"address=0x{address:08X}\nlength={length}\nread=1\ndata[0]={' '.join(parts)}"
+        return {
+            "transport": "h7tool_hid/function_66/subfunctions_0_1",
+            "reports": reports,
+            "result": {
+                "raw": raw,
+                "format": "h7tool_read_memory",
+                "data": {
+                    "address": f"0x{address:08X}",
+                    "length": length,
+                    "read": 1,
+                    "data_hex": " ".join(parts),
+                    "data_bytes": parts,
+                    "ok": len(data) == length,
+                },
+            },
+        }
+
+    # ------------------------------------------------------------------
+    #  native EMMC file management (function 0x64 sub-functions)
+    # ------------------------------------------------------------------
+    NATIVE_LIST_FILE = 2
+    NATIVE_GET_FILE_MD5 = 3
+    NATIVE_DEL_FILE = 4
+    NATIVE_READ_FILE = 6
+    NATIVE_WRITE_FILE = 7
+    NATIVE_CREATE_FOLDER = 8
+
+    def _native_exchange(self, func: int, total: int, offset: int, payload: bytes,
+                         timeout_ms: int | None = None) -> bytes:
+        """One 0x64 file-management exchange. The request is written exactly once.
+
+        Re-sending a WRITE_FILE packet makes the firmware buffer the same bytes a
+        second time (its duplicate check only compares offsets after the first
+        packet), which silently doubles a file.
+        """
+        try:
+            import hid  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
+        unit_id = int(self.config.get("unit_id", 1))
+        body = struct.pack(">BBHIII", unit_id, 0x64, func, total, offset, len(payload)) + payload
+        frame = body + crc16_modbus(body).to_bytes(2, "little")
+        item = self._find_interface()
+        budget = timeout_ms or max(3000, int(self.config.get("timeout_ms", 1000)))
+        dev = hid.device()
+        try:
+            dev.open_path(item["path"])
+            for _ in range(64):
+                if not dev.read(1024, 15):
+                    break
+            dev.write(b"\0" + frame + b"\0" * (1025 - 1 - len(frame)))
+            deadline = time.monotonic() + budget / 1000
+            while time.monotonic() < deadline:
+                reply = bytes(dev.read(1024, 200)).rstrip(b"\0")
+                if len(reply) < 7 or reply[0] != unit_id or reply[1] != 0x64:
+                    continue
+                if struct.unpack(">H", reply[2:4])[0] != func:
+                    continue
+                return reply
+        except BridgeError:
+            raise
+        except Exception as exc:
+            raise BridgeError(f"H7-TOOL file request failed: {exc}") from exc
+        finally:
+            try:
+                dev.close()
+            except Exception:
+                pass
+        raise BridgeError("no matching H7-TOOL file reply; close the vendor PC application and retry")
+
+    def native_list(self, directory: str) -> list[dict[str, Any]]:
+        """List a directory. Lines look like F<hex size>|<date> <time>|<name>."""
+        head = directory.rstrip("/").encode("gbk") + b"\0"
+        padding = b"\0" * max(0, 1000 - len(head))
+        reply = self._native_exchange(self.NATIVE_LIST_FILE, 0, 0, head + padding, 6000)
+        total = struct.unpack(">I", reply[5:9])[0]
+        pkg = struct.unpack(">I", reply[13:17])[0]
+        data = bytearray(reply[17:17 + min(pkg, total)]) if total else bytearray()
+        while len(data) < total:
+            reply = self._native_exchange(self.NATIVE_LIST_FILE, total, len(data), head + padding, 6000)
+            pkg = struct.unpack(">I", reply[13:17])[0]
+            piece = reply[17:17 + pkg]
+            if not piece:
+                break
+            data += piece
+        entries: list[dict[str, Any]] = []
+        for line in data.decode("gbk", "replace").splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            kind, rest = line[0], line[1:]
+            parts = rest.split("|")
+            if len(parts) < 3:
+                continue
+            try:
+                size = int(parts[0].strip(), 16)
+            except ValueError:
+                size = None
+            entries.append({
+                "name": parts[2].strip(),
+                "directory": kind.upper() == "D",
+                "size": size,
+                "stamp": parts[1].strip(),
+            })
+        return entries
+
+    @staticmethod
+    def _native_path(path: str, pad: int = 0) -> bytes:
+        """NUL-terminated path payload.
+
+        The firmware does not terminate the path itself: without a NUL it reads past the
+        string and stores whatever followed it in the buffer, creating entries whose name
+        has trailing garbage (and which then cannot be deleted by their intended name).
+        """
+        raw = path.encode("gbk") + b"\0"
+        return raw + b"\0" * (pad - len(raw)) if pad > len(raw) else raw
+
+    def native_md5(self, path: str) -> tuple[int, str]:
+        reply = self._native_exchange(self.NATIVE_GET_FILE_MD5, 0, 0, self._native_path(path), 6000)
+        return struct.unpack(">I", reply[5:9])[0], reply[9:25].hex()
+
+    def native_delete(self, path: str) -> int:
+        reply = self._native_exchange(self.NATIVE_DEL_FILE, 0, 0, self._native_path(path), 6000)
+        return reply[4]
+
+    def native_mkdir(self, path: str) -> int:
+        reply = self._native_exchange(self.NATIVE_CREATE_FOLDER, 0, 0, self._native_path(path, 64), 6000)
+        return reply[4]
+
+    def native_read_window(self, path: str, offset: int, length: int) -> bytes:
+        """Read up to `length` bytes from `offset` (one or more 0x64 requests).
+
+        The device answers bytes=0 to the first request after a file has just been
+        written: measured on a fresh 48-byte file the reply carried total=48 bytes=0
+        and the immediate retry returned all 48 bytes, because the FAT directory
+        entry is not flushed yet. An empty reply is therefore retried instead of
+        being treated as end-of-file.
+        """
+        head = path.encode("gbk") + b"\0"
+        # the request's package_len doubles as the device's read length, exactly as it
+        # does for LIST, so the payload is padded to pull a full 1 KiB per round trip
+        # (an unpadded payload returns only len(path) bytes and a 20 KB read then needs
+        # hundreds of USB round trips, which trips hidapi with "read error")
+        # 256 bytes: a multiple of 32, because ReadFileToMem calls
+        # SCB_InvalidateDCache_by_Addr(_Buff, _MaxLen) and an unaligned length lets the
+        # invalidate walk into neighbouring lines - a 1000-byte read corrupted data and
+        # then hard-faulted the firmware into a watchdog reset.
+        payload = head + b"\0" * max(0, 256 - len(head))
+        total: int | None = None
+        data = bytearray()
+        empty = 0
+        while total is None or len(data) < min(total, offset + length):
+            reply = self._native_exchange(self.NATIVE_READ_FILE, total or 0, offset + len(data), payload, 8000)
+            if total is None:
+                total = struct.unpack(">I", reply[5:9])[0]
+                if total == 0:
+                    return b""
+            got = struct.unpack(">I", reply[13:17])[0]
+            if got == 0:
+                empty += 1
+                if empty > 4:
+                    break
+                time.sleep(0.15)
+                continue
+            empty = 0
+            data += reply[17:17 + got]
+            if len(data) >= length:
+                break
+        return bytes(data[:length])
+
+    def native_read(self, path: str, chunk: int = 1000) -> bytes:
+        payload = path.encode("gbk") + b"\0"
+        reply = self._native_exchange(self.NATIVE_READ_FILE, 0, 0, payload, 8000)
+        total = struct.unpack(">I", reply[5:9])[0]
+        got = struct.unpack(">I", reply[13:17])[0]
+        data = bytearray(reply[17:17 + got])
+        while len(data) < total:
+            reply = self._native_exchange(self.NATIVE_READ_FILE, total, len(data), payload, 8000)
+            got = struct.unpack(">I", reply[13:17])[0]
+            if got == 0:
+                break
+            data += reply[17:17 + got]
+        return bytes(data)
+
+    def native_write(self, path: str, content: bytes, progress=None) -> tuple[int, str]:
+        """Write a file, working around two firmware bugs in MODS64_WriteFile.
+
+        1) `if (s_FileRxLen >= total_len - s_HeaderLen)` compares two uint32_t values, so
+           a file shorter than the 21+name header wraps the subtraction to ~4.29e9: the
+           test never passes, the file is never written, and the device still reports
+           err 0. Declaring total_len = real + header removes the wrap.
+        2) that same test marks the file complete, so no intermediate packet may reach
+           it: the final packet is always kept larger than the header.
+
+        Byte-exact for 1 byte .. 20 KB on APP V2.33 after both fixes.
+        """
+        import hashlib as _hashlib
+        name = path.encode("gbk")
+        if len(name) > 255:
+            raise BridgeError("device path is too long for the name field")
+        real = len(content)
+        header = struct.pack(">I", real) + _hashlib.md5(content).digest() + bytes([len(name)]) + name
+        h_len = len(header)
+        declared = real if real >= h_len else real + h_len
+        if declared != real:
+            header = struct.pack(">I", declared) + header[4:]
+        guard = max(1, real - (declared - h_len) + 1)
+        capacity = max(64, 1000 - h_len)
+        offset, first, packets = 0, True, 0
+        while offset < real:
+            room = capacity if first else 1000
+            take = min(room, real - offset)
+            if real - offset > room and (real - offset - take) < guard:
+                take = real - offset - guard
+            piece = (header if first else b"") + content[offset:offset + take]
+            reply = self._native_exchange(self.NATIVE_WRITE_FILE, declared, offset, piece, 8000)
+            if reply[4] not in (0, 1):
+                return reply[4], f"device reported error {reply[4]} at offset {offset}"
+            offset += take
+            first = False
+            packets += 1
+            if progress:
+                progress(offset, real)
+        return 0, f"wrote {real} bytes in {packets} packet(s)"
+
+    def read_display(self, offset: int, length: int) -> bytes:
+        """Read a slice of the tool's own LCD framebuffer.
+
+        Function 0x66, subfunction 0x0100 (H66_READ_DISP_MEM): the firmware
+        memcpy's straight out of the framebuffer at 0x30000000, so the reply is
+        raw RGB565 little-endian, with no compression and no framing beyond the
+        echo of offset and length.
+        """
+        if not 0 <= offset <= 0xFFFFFFFF or not 1 <= length <= 1009:
+            raise BridgeError("display read needs a 32-bit offset and a length of 1..1009")
+        try:
+            import hid  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
+        item = self._find_interface()
+        timeout_ms = max(200, int(self.config.get("timeout_ms", 1000)))
+        unit_id = int(self.config.get("unit_id", 1))
+        body = struct.pack(">BBHII", unit_id, 0x66, 0x0100, offset, length)
+        request = body + crc16_modbus(body).to_bytes(2, "little")
+        request_report = b"\0" + request + b"\0" * (1025 - 1 - len(request))
+        dev = hid.device()
+        try:
+            dev.open_path(item["path"])
+            if offset == 0:
+                # A script that redraws the panel leaves stale replies queued
+                # (hundreds were seen), and they would be mistaken for ours.
+                for _ in range(400):
+                    if not dev.read(1024, 20):
+                        break
+            deadline = time.monotonic() + max(2.0, timeout_ms / 1000)
+            while time.monotonic() < deadline:
+                dev.write(request_report)
+                reply = bytes(dev.read(1024, 150)).rstrip(b"\0")
+                if len(reply) < 15 or reply[0] != unit_id or reply[1] != 0x66:
+                    continue
+                if reply[2:4] != b"\x01\x00":
+                    continue
+                if struct.unpack(">II", reply[4:12]) != (offset, length):
+                    continue
+                if reply[12] != 0:
+                    raise BridgeError(f"H7-TOOL reported display read error {reply[12]}")
+                data = reply[13 : 13 + length]
+                if len(data) != length:
+                    continue
+                if crc16_modbus(reply[: 13 + length]) != int.from_bytes(reply[13 + length : 15 + length], "little"):
+                    continue
+                return data
+        except BridgeError:
+            raise
+        except Exception as exc:  # hidapi has platform-specific exception types
+            raise BridgeError(f"H7-TOOL display read failed: {exc}") from exc
+        finally:
+            try:
+                dev.close()
+            except Exception:
+                pass
+        raise BridgeError("no matching H7-TOOL display read reply; close the vendor PC application and retry")
+
     def _run_lua_script(
+        self,
+        script: bytes,
+        script_label: str,
+        begin_marker: bytes | None = None,
+        end_marker: bytes | None = None,
+        retry_on_empty: int = 0,
+    ) -> dict[str, Any]:
+        """Run a Lua script, retrying when the tool answers but never prints.
+
+        The tool acknowledges function 0x64 before its Lua VM is ready, and
+        occasionally a run then returns that acknowledgement with no print output
+        at all; the next identical attempt normally works.  Read-only callers and
+        callers whose write is idempotent ask for a retry.  A script with side
+        effects must opt in, because a lost output cannot be told apart from a
+        script that ran and printed nothing.
+        """
+        attempts = 1 + max(0, int(retry_on_empty))
+        for attempt in range(attempts):
+            try:
+                return self._run_lua_script_once(script, script_label, begin_marker, end_marker, attempts > 1)
+            except BridgeError as exc:
+                silent = "produced no output" in str(exc) or "diagnostic output was incomplete" in str(exc)
+                if not silent or attempt == attempts - 1:
+                    raise
+                time.sleep(0.4)
+        raise BridgeError(f"Lua {script_label} did not run after {attempts} attempts")
+
+    def _run_lua_script_once(
         self,
         script: bytes,
         script_label: str,
         begin_marker: bytes | None,
         end_marker: bytes | None,
+        fail_fast_on_silence: bool = False,
     ) -> dict[str, Any]:
-        try:
-            import hid  # type: ignore[import-not-found]
-        except ImportError as exc:
-            raise BridgeError("H7-TOOL USB HID support needs hidapi: & $py -m pip install -r .\\mcp\\requirements.txt") from exc
         strict_markers = begin_marker is not None and end_marker is not None
         if strict_markers and (begin_marker not in script or end_marker not in script):
             raise BridgeError(f"Lua script {script_label} failed its safety marker check")
         item = self._find_interface()
         timeout_ms = max(1000, int(self.config.get("timeout_ms", 8000)))
+        # How long the output may stay quiet before a non-marker script is treated
+        # as finished.  Too small a value truncates output; timeout_ms caps it.
+        quiet_s = max(0.05, float(self.config.get("print_quiet_ms", 500)) / 1000.0)
+        chunk_bytes = int(self.config.get("lua_chunk_bytes", LUA_CHUNK_BYTES))
+        chunk_bytes = max(64, min(chunk_bytes, LUA_MAX_CHUNK_BYTES))
+        chunk_delay_s = max(0.0, float(self.config.get("lua_chunk_delay_ms", 4)) / 1000.0)
+        drain_s = max(0.0, float(self.config.get("drain_before_run_ms", 150)) / 1000.0)
         payload = script + (b"" if script.endswith(b"\0") else b"\0")
-        request_body = struct.pack(">BBHIII", 1, 0x64, 0, len(payload), 0, len(payload)) + payload
-        request = request_body + crc16_modbus(request_body).to_bytes(2, "little")
+        total = len(payload)
         output = bytearray()
         ack_seen = False
+        ack_at = 0.0
         reports = 0
         last_output_at = 0.0
         dev = hid.device()
         try:
             dev.open_path(item["path"])
-            written = dev.write(self._report(request))
-            if written != 1025:
-                raise BridgeError("H7-TOOL HID write did not accept the Lua request")
+            channel = 0
+            # Discard print output left over from an earlier script so it cannot be
+            # reported as if this run produced it.
+            drain_until = time.monotonic() + drain_s
+            while time.monotonic() < drain_until:
+                dev.write(self._report(self._lua_poll_frame(channel)))
+                channel = (channel + 1) % 5
+                bytes(dev.read(1024, 20))
+                time.sleep(0.01)
+            # Send the script as (total, offset, chunk) reports.
+            offset = 0
+            while offset < total:
+                piece = payload[offset : offset + chunk_bytes]
+                request_body = struct.pack(">BBHIII", 1, 0x64, 0, total, offset, len(piece)) + piece
+                request = request_body + crc16_modbus(request_body).to_bytes(2, "little")
+                written = dev.write(self._report(request))
+                if written != 1025:
+                    raise BridgeError("H7-TOOL HID write did not accept the Lua request")
+                offset += len(piece)
+                if chunk_delay_s:
+                    time.sleep(chunk_delay_s)
             deadline = time.monotonic() + timeout_ms / 1000
             next_poll = 0.0
-            channel = 0
             while time.monotonic() < deadline:
                 now = time.monotonic()
                 if now >= next_poll:
                     dev.write(self._report(self._lua_poll_frame(channel)))
                     channel = (channel + 1) % 5
                     next_poll = now + 0.02
-                if not strict_markers and ack_seen and output and last_output_at and now - last_output_at > 0.35:
+                if not strict_markers and ack_seen and output and last_output_at and now - last_output_at > quiet_s:
                     break
+                # Every script this module generates prints its begin marker
+                # first, so sustained silence after the acknowledgement means the
+                # run was lost rather than slow.
+                if strict_markers and fail_fast_on_silence and ack_seen and not output and ack_at and now - ack_at > 2.0:
+                    raise BridgeError(
+                        f"Lua {script_label} produced no output; the H7-TOOL acknowledged the script but never ran it - "
+                        "press C on the H7-TOOL (or power-cycle it) to clear a wedged Lua session, then retry"
+                    )
                 report = bytes(dev.read(1024, 50))
                 if not report:
                     continue
                 reports += 1
                 if self._extract_lua_ack(report):
                     ack_seen = True
+                    ack_at = time.monotonic()
                     continue
                 text = self._extract_lua_print(report)
                 if text is not None:
@@ -2662,7 +3364,10 @@ class H7ToolHidModbusAdapter:
             begin_text = begin_marker.decode("ascii")
             end_text = end_marker.decode("ascii")
             if begin_text not in decoded or end_text not in decoded:
-                raise BridgeError(f"Lua was acknowledged but diagnostic output was incomplete: {decoded!r}")
+                raise BridgeError(
+                    "Lua was acknowledged but diagnostic output was incomplete: "
+                    f"{decoded!r}; press C on the H7-TOOL (or power-cycle it) to clear a wedged Lua session, then retry"
+                )
         return {
             "transport": "h7tool_hid/function_64_lua + function_61_print_poll",
             "script": script_label,
@@ -2677,7 +3382,7 @@ class H7ToolHidModbusAdapter:
             script = script_path.read_bytes()
         except OSError as exc:
             raise BridgeError(f"Cannot read bundled Lua script {script_name}: {exc}") from exc
-        return self._run_lua_script(script, f"diagnostics/{script_name}", begin_marker, end_marker)
+        return self._run_lua_script(script, f"diagnostics/{script_name}", begin_marker, end_marker, retry_on_empty=1)
 
     def run_health_script(self) -> dict[str, Any]:
         return self._run_fixed_lua_script("tool_health.lua", b"H7TOOL_DIAG_BEGIN", b"H7TOOL_DIAG_END")
@@ -3090,7 +3795,10 @@ class H7ToolMcp:
     def status(self) -> dict[str, Any]:
         return {
             "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
-        "safety": "development-assistant mode; flash, erase, power, reset, and protection-changing actions are not exposed as MCP tools",
+            "safety": (
+                "development-assistant mode; destructive target programming is not exposed. "
+                "Narrow H7-TOOL mode changes require the configured power-level confirmation."
+            ),
             "adapter": self.adapter.kind,
             "config_path": str(self.config_path),
             "configured_commands": sorted(self.config["commands"].keys()),
@@ -3160,13 +3868,42 @@ class H7ToolMcp:
         return LegacyH7ToolLuaSerialAdapter(self.config["adapter"]).run_health_script()
 
     def read_hid_lua_health(self) -> dict[str, Any]:
-        return self.hid_modbus.run_health_script()
+        return self._script_adapter().run_health_script()
 
     def read_hid_target_probe(self) -> dict[str, Any]:
-        return self.hid_modbus.run_target_probe_script()
+        return self._script_adapter().run_target_probe_script()
 
-    def read_hid_target_memory(self, address: int, length: int) -> dict[str, Any]:
-        return self.hid_modbus.run_read_memory_script(address, length)
+    def read_hid_target_memory(self, address: int, length: int, transport: str = "lua") -> dict[str, Any]:
+        if transport == "native":
+            return self.hid_modbus.read_target_memory(address, length)
+        if transport != "lua":
+            raise BridgeError("read_memory transport must be lua or native")
+        return self._script_adapter().run_read_memory_script(address, length)
+
+    def tool_mode_switch(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError("tool_mode_switch requires adapter.type = h7tool_hid")
+        mode = str(arguments.get("mode", ""))
+        # Deliberately exclude bootloader, DAP and programmer modes.  They are
+        # documented for research but are too easy to select accidentally.
+        modes = {
+            "restart_app": (1, "normal application restart"),
+            "emmc": (4, "USB mass-storage / EMMC mode"),
+            "link": (5, "PC link mode"),
+        }
+        if mode not in modes:
+            raise BridgeError("mode must be restart_app, emmc, or link")
+        require_dangerous_confirmation(self.config, "power", str(arguments.get("confirmation", "")))
+        value, description = modes[mode]
+        self.hid_modbus.write_single_register_no_reply(0xFF7F, value)
+        return {
+            "requested": True,
+            "mode": mode,
+            "register": "0xFF7F",
+            "value": value,
+            "description": description,
+            "warning": "The HID interface may disconnect or re-enumerate immediately; this is expected.",
+        }
 
     def uart_transact(self, arguments: dict[str, Any]) -> dict[str, Any]:
         channel = int(arguments.get("channel", 1))
@@ -3202,9 +3939,7 @@ class H7ToolMcp:
             tx_data = b""
         if len(tx_data) > 512:
             raise BridgeError("UART send payload is limited to 512 bytes")
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("uart_transact currently requires adapter.type = h7tool_hid")
-        return self.hid_modbus.run_uart_transact_script(
+        return self._script_adapter().run_uart_transact_script(
             channel=channel,
             baudrate=baudrate,
             parity=parity,
@@ -3259,9 +3994,7 @@ class H7ToolMcp:
         max_data_len = 64 if mode == 2 else 8
         if len(tx_data) > max_data_len:
             raise BridgeError(f"CAN data payload is limited to {max_data_len} bytes for this mode")
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("can_transact currently requires adapter.type = h7tool_hid")
-        return self.hid_modbus.run_can_transact_script(
+        return self._script_adapter().run_can_transact_script(
             mode=mode,
             fifo_len=fifo_len,
             bitrate=bitrate,
@@ -3303,7 +4036,7 @@ class H7ToolMcp:
             raise BridgeError("I2C write payload is limited to 256 bytes")
         if self.adapter.kind != "h7tool_hid":
             raise BridgeError("i2c_transact currently requires adapter.type = h7tool_hid")
-        return self.hid_modbus.run_i2c_transact_script(
+        return self._script_adapter().run_i2c_transact_script(
             clock_hz=clock_hz,
             scan=scan,
             address=address,
@@ -3342,9 +4075,7 @@ class H7ToolMcp:
             write_data = b""
         if len(write_data) > 256:
             raise BridgeError("SPI write payload is limited to 256 bytes")
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("spi_transact currently requires adapter.type = h7tool_hid")
-        return self.hid_modbus.run_spi_transact_script(
+        return self._script_adapter().run_spi_transact_script(
             freq_id=freq_id,
             phase=phase,
             polarity=polarity,
@@ -3395,9 +4126,7 @@ class H7ToolMcp:
             raise BridgeError("No RTT address or search ranges are available")
         if len(ranges) > 16:
             raise BridgeError("Refusing to scan more than 16 RTT ranges")
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("rtt_read currently requires adapter.type = h7tool_hid")
-        return self.hid_modbus.run_rtt_read_script(
+        return self._script_adapter().run_rtt_read_script(
             control_block_address=control_block_address,
             ranges=ranges,
             channel=channel,
@@ -3406,8 +4135,6 @@ class H7ToolMcp:
         )
 
     def read_option_bytes(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("read_option_bytes currently requires adapter.type = h7tool_hid")
         profile = read_selected_target_profile(self.config, arguments)
         address_texts = profile.get("option_byte_addresses", [])
         if not isinstance(address_texts, list) or not address_texts:
@@ -3417,7 +4144,7 @@ class H7ToolMcp:
             if not isinstance(item, str):
                 continue
             addresses.append(int(item, 16))
-        result = self.hid_modbus.run_read_option_bytes_script(addresses)
+        result = self._script_adapter().run_read_option_bytes_script(addresses)
         result["profile"] = {
             "relative_path": profile.get("relative_path"),
             "vendor": profile.get("vendor"),
@@ -3427,8 +4154,6 @@ class H7ToolMcp:
         return result
 
     def protection_status(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("protection_status currently requires adapter.type = h7tool_hid")
         profile = read_selected_target_profile(self.config, arguments)
         checks = profile.get("protection_checks", [])
         if not isinstance(checks, list) or not checks:
@@ -3437,7 +4162,7 @@ class H7ToolMcp:
         for check in checks:
             if isinstance(check, dict) and isinstance(check.get("address"), str):
                 addresses.append(int(check["address"], 16))
-        read_result = self.hid_modbus.run_read_option_bytes_script(addresses)
+        read_result = self._script_adapter().run_read_option_bytes_script(addresses)
         entries = read_result["result"]["data"].get("entries", [])
         values_by_address = {
             entry["address"].upper(): int(str(entry["value"]), 16)
@@ -3486,8 +4211,6 @@ class H7ToolMcp:
         }
 
     def target_identity(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("target_identity currently requires adapter.type = h7tool_hid")
         profile = read_selected_target_profile(self.config, arguments)
         probe = self.read_hid_target_probe()
         probe_data = probe["result"]["data"]
@@ -3567,8 +4290,6 @@ class H7ToolMcp:
         return result
 
     def target_flash_info(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("target_flash_info currently requires adapter.type = h7tool_hid")
         profile = read_selected_target_profile(self.config, arguments)
         address_text = arguments.get("address")
         if isinstance(address_text, str) and address_text.strip():
@@ -3594,8 +4315,6 @@ class H7ToolMcp:
         confirmation = str(arguments.get("confirmation", ""))
         if not execute:
             raise BridgeError("lua_draft_run requires execute=true")
-        if self.adapter.kind != "h7tool_hid":
-            raise BridgeError("lua_draft_run requires adapter.type = h7tool_hid")
         path = _lua_draft_path(name)
         if not path.exists():
             raise BridgeError(f"Lua draft not found: {path.name}")
@@ -3616,7 +4335,14 @@ class H7ToolMcp:
         has_user_markers = b"H7TOOL_USER_BEGIN" in script and b"H7TOOL_USER_END" in script
         begin_marker = b"H7TOOL_USER_BEGIN" if has_user_markers else None
         end_marker = b"H7TOOL_USER_END" if has_user_markers else None
-        result = self.hid_modbus._run_lua_script(script, f"workspace/lua_drafts/{path.name}", begin_marker, end_marker)
+        retry_on_empty = 1 if bool(arguments.get("retry_on_empty", False)) else 0
+        result = self._script_adapter()._run_lua_script(
+            script,
+            f"workspace/lua_drafts/{path.name}",
+            begin_marker,
+            end_marker,
+            retry_on_empty=retry_on_empty,
+        )
         result["review"] = review
         result["draft"] = {"name": path.name, "relative_path": f"workspace/lua_drafts/{path.name}"}
         result["output_contract"] = "structured_markers" if has_user_markers else "raw_output"
@@ -3658,6 +4384,265 @@ class H7ToolMcp:
             except BridgeError as exc:
                 sections["target_summary_error"] = str(exc)
         return diagnostic_report(arguments, self.config, sections)
+
+    def _require_hid_adapter(self, tool: str) -> None:
+        if self.adapter.kind != "h7tool_hid":
+            raise BridgeError(f"{tool} requires adapter.type = h7tool_hid")
+
+    def _hid_lua_bytes(self, data: bytes) -> bytes:
+        """Lua expression that rebuilds exact bytes (path or payload)."""
+        return ("string.char(" + ",".join(str(value) for value in data) + ")").encode("ascii")
+
+    FILE_NATIVE_METHODS = ("native_list", "native_md5", "native_delete", "native_mkdir",
+                           "native_read_window", "native_read", "native_write")
+
+    SCRIPT_WRAPPERS = tuple(
+        n for n in dir(H7ToolHidModbusAdapter)
+        if n.endswith("_script") and not n.startswith("__"))
+
+    def _script_adapter(self):
+        """Script-driven tools run the same Lua over USB or over the wireless link."""
+        if self.adapter.kind == "modbus_udp":
+            for name in self.SCRIPT_WRAPPERS + ("_run_lua_script", "_run_lua_script_once"):
+                if hasattr(ModbusUdpAdapter, name):
+                    continue
+                setattr(ModbusUdpAdapter, name, getattr(H7ToolHidModbusAdapter, name))
+            return self.modbus_udp
+        if self.adapter.kind == "h7tool_hid":
+            return self.hid_modbus
+        raise BridgeError(
+            "script-driven tools require adapter.type = h7tool_hid (USB) or modbus_udp (wireless)")
+
+    def _file_adapter(self):
+        """Native 0x64 file access works over USB HID and over the wireless UDP transport.
+
+        ModbusUdpAdapter reuses the HID adapter's file logic; only the transport differs,
+        so its _native_exchange is swapped for the UDP one here (bound once, lazily).
+        """
+        if self.adapter.kind == "modbus_udp":
+            if not getattr(ModbusUdpAdapter, "_native_bound", False):
+                ModbusUdpAdapter._native_path = staticmethod(H7ToolHidModbusAdapter._native_path)
+                for name in self.FILE_NATIVE_METHODS:
+                    setattr(ModbusUdpAdapter, name, getattr(H7ToolHidModbusAdapter, name))
+                for name in dir(H7ToolHidModbusAdapter):
+                    if name.startswith("NATIVE_"):          # sub-function constants
+                        setattr(ModbusUdpAdapter, name, getattr(H7ToolHidModbusAdapter, name))
+                ModbusUdpAdapter._native_exchange = ModbusUdpAdapter._udp_native_exchange
+                ModbusUdpAdapter._native_bound = True
+            return self.modbus_udp
+        if self.adapter.kind == "h7tool_hid":
+            return self.hid_modbus
+        raise BridgeError(
+            "device_file_* requires adapter.type = h7tool_hid (USB) or modbus_udp (wireless)")
+
+    def _native_file_path(self, path: str, encoding: str) -> str:
+        """Validate the device path and make sure it survives the GBK FAT."""
+        raw = self._device_path_bytes(path, encoding)
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            return raw.decode("gbk", "replace")
+
+    def _device_path_bytes(self, path: str, encoding: str) -> bytes:
+        try:
+            raw = path.encode(encoding)
+        except (UnicodeEncodeError, LookupError) as exc:
+            raise BridgeError(f"cannot encode the device path with {encoding}: {exc}") from exc
+        if not (raw.startswith(b"0:/") or raw.startswith(b"1:/")):
+            raise BridgeError("device path must start with 0:/ (EMMC) or 1:/ (SD card)")
+        if b"\0" in raw or len(raw) > 200:
+            raise BridgeError("device path is not usable")
+        return raw
+
+    def device_file_write(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Write one file to the H7-TOOL EMMC/SD over the native 0x64 channel.
+
+        The native writer appends from offset 0 without truncating - writing 5
+        bytes over a 2048-byte file reported success and left it at 2048 bytes - so
+        the file is deleted first, then written, then read back and hash-checked.
+        The device verifies its own MD5 as well and skips the transfer entirely
+        when identical content is already there.
+        """
+        require_dangerous_confirmation(self.config, "write", str(arguments.get("confirmation", "")))
+        path = str(arguments.get("path", "")).strip()
+        if not path:
+            raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/app.lua")
+        path_encoding = str(arguments.get("path_encoding", "gbk"))
+        content_encoding = str(arguments.get("content_encoding", "utf-8"))
+        raw_base64 = arguments.get("content_base64")
+        if isinstance(raw_base64, str) and raw_base64.strip():
+            try:
+                content = base64.b64decode(raw_base64, validate=True)
+            except Exception as exc:
+                raise BridgeError(f"content_base64 is not valid base64: {exc}") from exc
+        else:
+            text = arguments.get("content")
+            if not isinstance(text, str):
+                raise BridgeError("content or content_base64 is required")
+            try:
+                content = text.encode(content_encoding)
+            except (UnicodeEncodeError, LookupError) as exc:
+                raise BridgeError(f"cannot encode content with {content_encoding}: {exc}") from exc
+        if not content:
+            raise BridgeError("content is empty")
+        native_path = self._native_file_path(path, path_encoding)
+
+        import hashlib as _hashlib
+        warnings: list[str] = []
+        previous = self._file_adapter().native_md5(native_path)[0]
+        if previous:
+            # without this a shorter rewrite leaves the old tail behind
+            self._file_adapter().native_delete(native_path)
+        error, detail = self._file_adapter().native_write(native_path, content)
+        if error not in (0, 1):
+            raise BridgeError(f"H7-TOOL rejected the file write: {detail}")
+        if error == 1:
+            warnings.append("the device reported an identical file already present; the transfer was skipped")
+        size, digest = self._file_adapter().native_md5(native_path)
+        expected = _hashlib.md5(content).hexdigest()
+        verified = size == len(content) and digest == expected
+        if not verified:
+            warnings.append(
+                "read-back verification failed; do not trust this file. "
+                f"size={size} md5={digest} expected_size={len(content)} expected_md5={expected} "
+                "(the tool must be idle for Lua work, but the native file channel works either way)"
+            )
+        return {
+            "path": path,
+            "path_encoding": path_encoding,
+            "protocol": "native 0x64 sub-function 7",
+            "bytes_written": len(content),
+            "device_size": size,
+            "device_md5": digest,
+            "expected_md5": expected,
+            "previously_existed": bool(previous),
+            "verified": verified,
+            "detail": detail,
+            "warnings": warnings,
+        }
+
+    def device_file_read(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Read a bounded window from one H7-TOOL EMMC/SD file (native 0x64 ch. 6).
+
+        This path never touches the Lua VM, so it also works while a mini program
+        is running on the tool.
+        """
+        path = str(arguments.get("path", "")).strip()
+        if not path:
+            raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/app.lua")
+        path_encoding = str(arguments.get("path_encoding", "gbk"))
+        offset = int(arguments.get("offset", 0))
+        length = int(arguments.get("length", 1024))
+        if offset < 0:
+            raise BridgeError("offset must not be negative")
+        if not 1 <= length <= 1024:
+            raise BridgeError(
+                "length must be between 1 and 1024: longer reads are not reliable. The device "
+                "invalidates its D-cache using the requested length, so multi-chunk reads came back "
+                "with wrong content at 2048 bytes and a 1000-byte chunk hard-faulted the firmware "
+                "into a watchdog reset. Read the file in 1024-byte windows instead."
+            )
+        native_path = self._native_file_path(path, path_encoding)
+        data = self._file_adapter().native_read_window(native_path, offset, length)
+        text: str | None = None
+        encoding = arguments.get("content_encoding")
+        if isinstance(encoding, str) and encoding:
+            try:
+                text = data.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                text = None
+        return {
+            "path": path,
+            "path_encoding": path_encoding,
+            "protocol": "native 0x64 sub-function 6",
+            "offset": offset,
+            "requested": length,
+            "bytes": len(data),
+            "content_base64": base64.b64encode(data).decode("ascii"),
+            "content": text,
+            "warnings": [] if data else ["the device returned no data (missing file or offset past the end)"],
+        }
+
+    def device_file_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """List a directory on the tool EMMC/SD over the native 0x64 protocol."""
+        path = str(arguments.get("path", "0:/H7-TOOL/Lua/My")).strip()
+        if not path:
+            raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My")
+        entries = self._file_adapter().native_list(path)
+        return {"path": path, "count": len(entries), "entries": entries}
+
+    def device_file_delete(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Delete one file on the tool (native 0x64 sub-function 4)."""
+        require_dangerous_confirmation(self.config, "write", str(arguments.get("confirmation", "")))
+        path = str(arguments.get("path", "")).strip()
+        if not path:
+            raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/old.lua")
+        error = self._file_adapter().native_delete(path)
+        return {"path": path, "error": error, "deleted": error == 0}
+
+    def device_file_mkdir(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Create a directory on the tool (native 0x64 sub-function 8)."""
+        require_dangerous_confirmation(self.config, "write", str(arguments.get("confirmation", "")))
+        path = str(arguments.get("path", "")).strip()
+        if not path:
+            raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/newdir")
+        error = self._file_adapter().native_mkdir(path)
+        return {
+            "path": path,
+            "error": error,
+            "created": error == 0,
+            "already_existed": error == 1,
+        }
+
+    def device_file_md5(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """File size and MD5 on the tool (native 0x64 sub-function 3)."""
+        self._require_hid_adapter("device_file_md5")
+        path = str(arguments.get("path", "")).strip()
+        if not path:
+            raise BridgeError("path is required, for example 0:/H7-TOOL/Lua/My/app.lua")
+        size, digest = self._file_adapter().native_md5(path)
+        return {"path": path, "size": size, "md5": digest}
+
+    def screenshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Capture the tool's own LCD and write it next to the caller as a PNG."""
+        width = int(arguments.get("width", 240))
+        height = int(arguments.get("height", 320))
+        if not 1 <= width <= 480 or not 1 <= height <= 480:
+            raise BridgeError("width and height must be 1..480")
+        chunk = int(arguments.get("chunk_bytes", 960))
+        chunk = max(16, min(chunk, 1009))
+        out = str(arguments.get("path", "")).strip()
+        if not out:
+            raise BridgeError("path is required, for example D:/shots/tool.png")
+        started = time.monotonic()
+        total = width * height * 2
+        frame = bytearray()
+        if self.adapter.kind == "modbus_udp":
+            read_chunk = self.modbus_udp.read_display_memory
+        else:
+            read_chunk = self.hid_modbus.read_display
+        while len(frame) < total:
+            want = min(chunk, total - len(frame))
+            frame += read_chunk(len(frame), want)
+        target = Path(out)
+        if target.parent and not target.parent.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+        png = png_from_rgb565(bytes(frame), width, height)
+        target.write_bytes(png)
+        elapsed = (time.monotonic() - started) * 1000
+        warnings: list[str] = []
+        if width * height * 2 != len(frame):
+            warnings.append("the captured frame is shorter than width*height*2")
+        return {
+            "path": str(target),
+            "width": width,
+            "height": height,
+            "framebuffer_bytes": len(frame),
+            "png_bytes": len(png),
+            "elapsed_ms": round(elapsed),
+            "kb_per_second": round(len(frame) / max(elapsed, 1), 1),
+            "warnings": warnings,
+        }
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "bridge_status":
@@ -3719,8 +4704,6 @@ class H7ToolMcp:
         if name == "health_summary":
             return self.health_summary()
         if name == "lua_health":
-            if self.adapter.kind != "h7tool_hid":
-                raise BridgeError("lua_health requires adapter.type = h7tool_hid")
             return self.read_hid_lua_health()
         if name == "tool_registers":
             if self.adapter.kind not in {"modbus_tcp", "modbus_udp", "h7tool_hid"}:
@@ -3762,6 +4745,7 @@ class H7ToolMcp:
         if name == "read_memory":
             address = str(arguments.get("address", ""))
             length = int(arguments.get("length", 0))
+            transport = str(arguments.get("transport", "lua"))
             max_length = int(self.config["limits"]["max_read_memory_bytes"])
             if not address.startswith("0x"):
                 raise BridgeError("address must be hexadecimal, for example 0x20000000")
@@ -3774,12 +4758,119 @@ class H7ToolMcp:
             if not 1 <= length <= max_length:
                 raise BridgeError(f"length must be between 1 and {max_length} bytes")
             if self.adapter.kind == "h7tool_hid":
-                return self.read_hid_target_memory(address_int, length)
+                return self.read_hid_target_memory(address_int, length, transport)
+            if transport != "lua":
+                raise BridgeError("read_memory transport selection is only available with adapter.type=h7tool_hid")
             return self.run_configured_command("read_memory", {"address": address, "length": length})
+        if name == "tool_mode_switch":
+            return self.tool_mode_switch(arguments)
+        if name == "device_file_write":
+            return self.device_file_write(arguments)
+        if name == "device_file_read":
+            return self.device_file_read(arguments)
+        if name == "screenshot":
+            return self.screenshot(arguments)
+        if name == "device_file_list":
+            return self.device_file_list(arguments)
+        if name == "device_file_delete":
+            return self.device_file_delete(arguments)
+        if name == "device_file_mkdir":
+            return self.device_file_mkdir(arguments)
+        if name == "device_file_md5":
+            return self.device_file_md5(arguments)
         raise BridgeError(f"Unknown tool: {name}")
 
 
 TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "device_file_list",
+        "description": (
+            "List a directory on the H7-TOOL EMMC (0:/) or SD card (1:/) over function 0x64 "
+            "sub-function 2 - the native file channel, so the DAP/debug interface stays alive. "
+            "Each entry carries its real size and the FAT timestamp. The path must not end with a "
+            "slash. This is the only way to list files: the Lua API's f_dir crashes the firmware."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "default": "0:/H7-TOOL/Lua/My"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "device_file_delete",
+        "description": (
+            "Delete one file on the H7-TOOL (function 0x64 sub-function 4). The Lua file API cannot "
+            "do this: os.remove is a silent no-op there. Gated as a dangerous action at level write."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "for example 0:/H7-TOOL/Lua/My/old.lua"},
+                "confirmation": {"type": "string"},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "device_file_mkdir",
+        "description": (
+            "Create a directory on the H7-TOOL EMMC/SD (function 0x64 sub-function 8). error 0 means "
+            "created, 1 means it already existed. Gated as a dangerous action at level write."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "for example 0:/H7-TOOL/Lua/My/newdir"},
+                "confirmation": {"type": "string"},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "device_file_md5",
+        "description": (
+            "Read a file's size and MD5 from the H7-TOOL (function 0x64 sub-function 3). The digest "
+            "is the plain MD5 of the file, verified against hashlib on a real device."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "screenshot",
+        "description": (
+            "Capture the H7-TOOL's own LCD and save it as a PNG. Reads the panel framebuffer with "
+            "function 0x66 subfunction 0x0100 (raw RGB565 little-endian, stride = panel width, no "
+            "compression); about 0.26 s for a 240x320 frame. Useful for checking what a Lua mini "
+            "program actually drew. Claim interface 2 exclusively: close the vendor PC application first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "PNG file to write, for example D:/shots/tool.png"},
+                "width": {"type": "integer", "default": 240, "minimum": 1, "maximum": 480},
+                "height": {"type": "integer", "default": 320, "minimum": 1, "maximum": 480},
+                "chunk_bytes": {
+                    "type": "integer",
+                    "default": 960,
+                    "minimum": 16,
+                    "maximum": 1009,
+                    "description": "bytes per 0x66 request; 1009 is the largest that fits one HID report",
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
     {
         "name": "bridge_status",
         "description": "Show bridge configuration and available serial ports/H7-TOOL HID interfaces. Does not contact H7-TOOL.",
@@ -3913,6 +5004,7 @@ TOOLS: list[dict[str, Any]] = [
                 "name": {"type": "string", "description": "Saved draft name under workspace/lua_drafts."},
                 "execute": {"type": "boolean", "description": "Must be true for every run."},
                 "confirmation": {"type": "string", "description": "Required only when review detects concrete dangerous levels allowed by dangerous_action_policy."},
+                "retry_on_empty": {"type": "boolean", "default": False, "description": "Retry once when the tool acknowledges the script but returns no output. Only set this when running the script twice is safe."},
             },
             "required": ["name", "execute"],
             "additionalProperties": False,
@@ -4235,14 +5327,79 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "read_memory",
-        "description": "Read a bounded target memory range. With adapter.type=h7tool_hid, uses a generated Lua memory-read template; other adapters require a configured command.",
+        "description": (
+            "Read a bounded target memory range. With adapter.type=h7tool_hid, transport=lua preserves "
+            "the generated Lua reader, while transport=native uses undocumented function 0x66 "
+            "subfunctions 0/1 directly and avoids the Lua VM. Other adapters require a configured command."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "address": {"type": "string", "pattern": "^0x[0-9A-Fa-f]+$"},
                 "length": {"type": "integer", "minimum": 1, "maximum": 1024},
+                "transport": {
+                    "type": "string",
+                    "enum": ["lua", "native"],
+                    "default": "lua",
+                    "description": "h7tool_hid only; native is function 0x66 and usually faster.",
+                },
             },
             "required": ["address", "length"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "tool_mode_switch",
+        "description": (
+            "Request one narrowly enumerated H7-TOOL mode through private register 0xFF7F: restart_app, "
+            "emmc, or link. Requires adapter.type=h7tool_hid and dangerous_actions level power. "
+            "The HID interface can disconnect immediately after the request."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["restart_app", "emmc", "link"]},
+                "confirmation": {"type": "string"},
+            },
+            "required": ["mode"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "device_file_write",
+        "description": (
+            "Write one file to the H7-TOOL EMMC/SD card and verify it by reading the result back. "
+            "Gated by dangerous_actions level 'write' in config.json. The tool has no delete or truncate call, "
+            "so directories must already exist and a shorter rewrite leaves an older longer file's tail in place."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute device path, for example 0:/H7-TOOL/Lua/My/app.lua"},
+                "content": {"type": "string", "description": "Text content. Do not combine with content_base64."},
+                "content_base64": {"type": "string", "description": "Binary content as base64. Takes precedence over content."},
+                "content_encoding": {"type": "string", "default": "utf-8", "description": "Encoding used to turn content into bytes."},
+                "path_encoding": {"type": "string", "default": "gbk", "description": "Encoding for the path. The tool FAT stores Chinese names as GBK."},
+                "confirmation": {"type": "string", "description": "Must match dangerous_actions.confirmation_phrase from config.json."},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "device_file_read",
+        "description": "Read a bounded window from one H7-TOOL EMMC/SD file, returning hex and optionally decoded text.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute device path, for example 0:/H7-TOOL/Lua/My/app.lua"},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "length": {"type": "integer", "minimum": 1, "maximum": 4096, "default": 256},
+                "path_encoding": {"type": "string", "default": "gbk"},
+                "content_encoding": {"type": "string", "default": "utf-8"},
+                "format": {"type": "string", "enum": ["text", "hex"], "default": "text"},
+            },
+            "required": ["path"],
             "additionalProperties": False,
         },
     },
@@ -4640,6 +5797,39 @@ def self_test(_server: H7ToolMcp) -> int:
         pass
     else:
         raise AssertionError("memory read limit was not enforced")
+    # EMMC file helpers and the chunked function-0x64 transfer.
+    assert rolling_byte_hash(b"") == 0
+    assert rolling_byte_hash(b"\x01\x02\x03") == 14
+    assert LUA_CHUNK_BYTES <= LUA_MAX_CHUNK_BYTES <= 1024 - 16 - 2
+    assert DEVICE_FILE_PAGE_BYTES == 4096
+    assert 1 <= DEVICE_FILE_MAX_READ <= 4096
+    tool_names = {tool["name"] for tool in TOOLS}
+    assert {"device_file_write", "device_file_read", "screenshot", "device_file_list",
+            "device_file_delete", "device_file_mkdir", "device_file_md5",
+            "tool_mode_switch", "read_memory"} <= tool_names
+    assert server._hid_lua_bytes(b"\x00\xff") == b"string.char(0,255)"
+    assert server._device_path_bytes("0:/H7-TOOL/Lua/My/app.lua", "gbk") == b"0:/H7-TOOL/Lua/My/app.lua"
+    assert server._device_path_bytes("0:/H7-TOOL/Lua/My/\u6a21\u62df.lua", "gbk") == (
+        "0:/H7-TOOL/Lua/My/\u6a21\u62df.lua".encode("gbk")
+    )
+    for bad_path in ("app.lua", "2:/x.lua", ""):
+        try:
+            server._device_path_bytes(bad_path, "gbk")
+        except BridgeError:
+            pass
+        else:
+            raise AssertionError(f"device path {bad_path!r} should have been rejected")
+    for tool in ("device_file_write", "device_file_read"):
+        try:
+            server.call_tool(tool, {"path": "0:/x.lua"})
+        except BridgeError as exc:
+            message = str(exc)
+            assert "h7tool_hid" in message or "dangerous actions are disabled" in message, (
+                f"{tool} rejection should name the adapter or closed safety gate: {exc}"
+            )
+        else:
+            raise AssertionError(f"{tool} should refuse a non-HID adapter")
+    assert not hasattr(server, "_run_lua_script"), "the Lua runner belongs to the HID adapter"
     print("Self-test passed: MCP bridge is running in safe mock mode.")
     return 0
 

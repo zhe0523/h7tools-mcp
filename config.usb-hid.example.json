@@ -6,7 +6,7 @@
     "interface_number": 2,
     "serial_number": "",
     "unit_id": 1,
-    "timeout_ms": 1000
+    "timeout_ms": 20000
   },
   "commands": {},
   "limits": {
